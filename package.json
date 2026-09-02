@@ -1,0 +1,37 @@
+{
+  "name": "webhook-engine",
+  "version": "0.1.0",
+  "description": "Reliable webhook ingestion. HMAC verification over the raw body, idempotency, backoff with jitter, and a replayable dead letter queue. Zero dependencies.",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "example",
+    "SPEC.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test",
+    "example": "node example/receiver.js"
+  },
+  "keywords": [
+    "webhook",
+    "hmac",
+    "signature",
+    "idempotency",
+    "retry",
+    "backoff",
+    "dead-letter-queue",
+    "replay"
+  ],
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {}
+}
