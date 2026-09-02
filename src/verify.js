@@ -30,6 +30,13 @@ export const DEFAULT_ALGORITHM = 'sha256';
 export const DEFAULT_ENCODING = 'hex';
 
 /**
+ * Five minutes, which is what the major providers use and the number people get wrong in
+ * both directions. Too tight and ordinary clock skew on the sender rejects genuine
+ * traffic. Too loose and the window stops meaning anything.
+ */
+export const DEFAULT_TOLERANCE_SECONDS = 300;
+
+/**
  * Compare two signature strings without leaking a byte-by-byte match through timing.
  *
  * The length comparison is not constant time, and does not need to be: the length of a
@@ -118,19 +125,36 @@ export function signHeader({ rawBody, secret, timestamp = null, algorithm, encod
  * @param {string|string[]} options.secret one key, or several during a rotation
  * @param {string} [options.algorithm]
  * @param {'hex'|'base64'} [options.encoding]
+ * @param {number} [options.timestamp] unix seconds, for providers that deliver the
+ *   timestamp in its own header. It is bound into the signed payload, never merely read.
+ * @param {number} [options.toleranceSeconds] replay window, in both directions
+ * @param {boolean} [options.requireTimestamp] default true
  * @param {number} [options.now] milliseconds, injectable so the window is testable
  * @returns {{valid: true, timestamp: number|null, keyIndex: number}
  *          |{valid: false, reason: string, timestamp?: number|null}}
- * @throws {TypeError} when no secret is configured
+ * @throws {TypeError} when no secret is configured, or the tolerance is not a whole
+ *   number of seconds
  */
 export function verifySignature({
   rawBody,
   header,
   secret,
+  timestamp: externalTimestamp,
+  toleranceSeconds = DEFAULT_TOLERANCE_SECONDS,
+  requireTimestamp = true,
   algorithm = DEFAULT_ALGORITHM,
   encoding = DEFAULT_ENCODING,
+  now = Date.now(),
 }) {
   const secrets = normaliseSecrets(secret);
+
+  // A tolerance that is not a number would compare as NaN and let every timestamp
+  // through, which is the failure mode of quietly disabling the window.
+  if (!Number.isInteger(toleranceSeconds) || toleranceSeconds < 0) {
+    throw new TypeError(
+      'webhook-engine: toleranceSeconds must be a non-negative whole number of seconds.',
+    );
+  }
 
   const bytes = toBytes(rawBody);
   if (bytes === null) return { valid: false, reason: 'no_raw_body' };
@@ -138,16 +162,42 @@ export function verifySignature({
   const parsed = parseSignatureHeader(header);
   if (parsed === null) return { valid: false, reason: 'malformed_header' };
 
-  const payload = signedPayload(bytes, parsed.timestamp);
+  const timestamp = resolveTimestamp(parsed.timestamp, externalTimestamp);
+  if (timestamp === CONFLICT) return { valid: false, reason: 'timestamp_conflict' };
+
+  if (timestamp === null) {
+    if (requireTimestamp) return { valid: false, reason: 'no_timestamp' };
+  } else if (Math.abs(Math.floor(now / 1000) - timestamp) > toleranceSeconds) {
+    // Checked before the HMAC, so a stale request costs two integers rather than a hash
+    // over a body an unauthenticated caller chose the size of.
+    return { valid: false, reason: 'timestamp_out_of_tolerance', timestamp };
+  }
+
+  const payload = signedPayload(bytes, timestamp);
 
   for (let keyIndex = 0; keyIndex < secrets.length; keyIndex += 1) {
     const expected = createHmac(algorithm, secrets[keyIndex]).update(payload).digest(encoding);
     for (const candidate of parsed.signatures) {
       if (constantTimeEqual(candidate, expected)) {
-        return { valid: true, timestamp: parsed.timestamp, keyIndex };
+        return { valid: true, timestamp, keyIndex };
       }
     }
   }
 
-  return { valid: false, reason: 'no_matching_signature', timestamp: parsed.timestamp };
+  return { valid: false, reason: 'no_matching_signature', timestamp };
+}
+
+/** Sentinel for a header timestamp and an out-of-band one that disagree. */
+const CONFLICT = Symbol('timestamp_conflict');
+
+/**
+ * A timestamp may arrive inside the signature header or in its own header. Both are
+ * bound into the signed payload. Two that disagree is a conflict rather than a
+ * preference, because silently picking one means the other was attacker-editable.
+ */
+function resolveTimestamp(headerTimestamp, externalTimestamp) {
+  if (externalTimestamp === undefined || externalTimestamp === null) return headerTimestamp;
+  if (!Number.isSafeInteger(externalTimestamp) || externalTimestamp < 0) return CONFLICT;
+  if (headerTimestamp !== null && headerTimestamp !== externalTimestamp) return CONFLICT;
+  return externalTimestamp;
 }
