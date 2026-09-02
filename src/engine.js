@@ -110,11 +110,22 @@ export function createEngine({
 
   const retryConfig = { ...DEFAULT_RETRY, ...retryOptions, ...(sleep ? { sleep } : {}) };
 
+  // THE SIGNED BODY DECIDES, AND THE HEADER IS ONLY A FALLBACK.
+  //
+  // The HMAC covers the body and the timestamp. It does not cover any other header, so
+  // an id read out of `webhook-id` is attacker-editable by anyone who can rewrite
+  // headers in flight — a proxy, a sidecar, a compromised load balancer. Preferring the
+  // header would let the same signed event be presented under a fresh id and processed a
+  // second time, which defeats deduplication without ever touching the signature.
+  //
+  // Where a provider does bind the id into the signature (the Standard Webhooks scheme
+  // signs `${id}.${timestamp}.${body}`), the header is as trustworthy as the body and
+  // this ordering costs nothing, because the two values agree.
   const defaultEventId = (body, headers) => {
-    const fromHeader = headers.get(idHeader);
-    if (typeof fromHeader === 'string' && fromHeader.length > 0) return fromHeader;
     const fromBody = body?.id ?? body?.event_id ?? body?.eventId;
-    return typeof fromBody === 'string' && fromBody.length > 0 ? fromBody : null;
+    if (typeof fromBody === 'string' && fromBody.length > 0) return fromBody;
+    const fromHeader = headers.get(idHeader);
+    return typeof fromHeader === 'string' && fromHeader.length > 0 ? fromHeader : null;
   };
   const resolveEventId = eventId ?? defaultEventId;
 
