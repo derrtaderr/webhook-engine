@@ -108,9 +108,19 @@ test('a redelivery is recognised and the handler is not run twice', async () => 
 test('a redelivery arriving while the first is still working gets a 409', async () => {
   // 409 rather than 200, because the first delivery may still fail. Telling the provider
   // "already done" while the work is unfinished is how an event disappears.
-  let release;
-  const gate = new Promise((resolve) => { release = resolve; });
-  const engine = engineWith(async () => { await gate; return 'done'; });
+  // The handler releases itself on a timer rather than waiting for the second response.
+  // An earlier version had the second response release it, which meant a store that
+  // handed out the key twice deadlocked instead of failing, and a deadlocked test
+  // reports nothing at all.
+  let concurrent = 0;
+  let peak = 0;
+  const engine = engineWith(async () => {
+    concurrent += 1;
+    peak = Math.max(peak, concurrent);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    concurrent -= 1;
+    return 'done';
+  });
   const request = delivery({ id: 'evt_6' });
 
   const first = engine.receive(request);
@@ -118,8 +128,8 @@ test('a redelivery arriving while the first is still working gets a 409', async 
   assert.equal(second.status, 409);
   assert.equal(second.outcome, 'in_flight');
 
-  release();
   assert.equal((await first).outcome, 'processed');
+  assert.equal(peak, 1, 'the handler was never running twice at once');
 });
 
 test('a transient failure is retried inside the request and then succeeds', async () => {

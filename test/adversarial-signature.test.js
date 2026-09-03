@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { timingSafeEqual } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 import { signPayload, signHeader, verifySignature, constantTimeEqual } from '../src/verify.js';
 
@@ -175,6 +177,27 @@ test('two empty strings do not compare equal, so an empty signature never matche
   // A digest is never empty, so the only way to reach this is a bug upstream. It should
   // not be the one comparison in the file that returns true for free.
   assert.equal(constantTimeEqual('', ''), false);
+});
+
+test('the comparison is built on timingSafeEqual, which is the one claim behaviour cannot make', () => {
+  // HONEST ABOUT WHAT THIS IS. Constant-time comparison and `===` return the same
+  // boolean for every input; the only difference between them is how long they take,
+  // and that is not observable from inside this process with any stability worth a CI
+  // job. The mutation check found exactly that: replacing the body of constantTimeEqual
+  // with `a === b` turned nothing red.
+  //
+  // So this is a source canary, not a behavioural test. It fails if someone swaps the
+  // primitive out. It does NOT prove the process is constant time — a JIT, a compiler,
+  // or the surrounding code can still leak. The README says so in its limits.
+  const source = readFileSync(fileURLToPath(new URL('../src/verify.js', import.meta.url)), 'utf8');
+
+  assert.match(source, /import \{[^}]*timingSafeEqual[^}]*\} from 'node:crypto'/);
+  assert.match(source, /return timingSafeEqual\(left, right\);/);
+  assert.doesNotMatch(
+    source,
+    /return\s+(candidate|presented)\s*===/,
+    'no string equality shortcut on the comparison path',
+  );
 });
 
 test('the same forgery is rejected the same way whether it is early or late in the digest', () => {

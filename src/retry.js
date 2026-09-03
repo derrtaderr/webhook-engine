@@ -104,6 +104,11 @@ export async function retry(fn, options = {}) {
   const { attempts, sleep = defaultSleep, shouldRetry, onAttempt } = config;
   const errors = [];
 
+  // The attempt bound is expressed twice: here, and in the `last` check below. The
+  // mutation check found that widening this condition alone changes nothing, because
+  // `last` still returns at the bound. That redundancy is deliberate — a loop over an
+  // attacker-influenced count wants a hard ceiling that does not depend on the logic
+  // inside it staying correct — but it means this line is not the one under test.
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
       const result = await fn(attempt);
