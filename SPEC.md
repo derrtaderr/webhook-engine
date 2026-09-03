@@ -315,8 +315,11 @@ correct one fails:
 ### The mutation check, and what it found
 
 The suite is mutation-checked: thirty-two guards were deleted one at a time and the number of
-failing tests recorded. A guard whose deletion turns nothing red is not guarded. Twenty-eight
-mutations were caught. Four were not, and each one is worth stating rather than tidying away.
+failing tests recorded. A guard whose deletion turns nothing red is not guarded.
+
+The first pass caught twenty-eight and missed four. After the fixes below the same pass catches
+thirty-one, and the one remaining survivor is a redundancy rather than a hole. Each of the four
+is worth stating rather than tidying away.
 
 1. **Replacing the constant-time comparison with `===` turned nothing red.** This is not
    fixable by a better behavioural test. The two return the same boolean for every input and
