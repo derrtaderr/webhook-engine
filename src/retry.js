@@ -130,6 +130,7 @@ export async function retry(fn, options = {}) {
     }
   }
 
-  /* c8 ignore next */
+  // Unreachable: the loop returns on every path. Kept so the function has no implicit
+  // undefined return if the bound above is ever edited.
   return { ok: false, attempts, errors };
 }

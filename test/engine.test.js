@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createEngine } from '../src/engine.js';
-import { signHeader } from '../src/verify.js';
+import { signHeader, signPayload } from '../src/verify.js';
 import { MemoryDeadLetterQueue } from '../src/dlq.js';
 
 const SECRET = 'whsec_fixture';
@@ -294,4 +294,89 @@ test('a request with no rawBody is a 400 rather than an exception', async () => 
   const response = await engine.receive({ headers: {} });
   assert.equal(response.status, 401);
   assert.equal(response.reason, 'no_raw_body');
+});
+
+test('parse can be switched off, and then the body stays the raw string', async () => {
+  // Some providers send form encoding or a protobuf. The engine should not insist the
+  // body is JSON in order to do the other three jobs.
+  const seen = [];
+  const engine = engineWith(async (event) => { seen.push(event); return 'ok'; }, { parse: null });
+
+  const rawBody = 'type=order.created&id=evt_20';
+  const response = await engine.receive({
+    rawBody,
+    headers: {
+      'webhook-id': 'evt_20',
+      'webhook-signature': signHeader({ rawBody, secret: SECRET, timestamp: SIGNED_AT }),
+    },
+  });
+
+  assert.equal(response.outcome, 'processed');
+  assert.equal(seen[0].body, rawBody, 'the body was not parsed');
+});
+
+test('a custom eventId function decides the deduplication key', async () => {
+  let calls = 0;
+  const engine = engineWith(async () => { calls += 1; return 'ok'; }, {
+    eventId: (body) => `${body.type}:${body.orderId}`,
+  });
+
+  const first = await engine.receive(delivery({ type: 'order.created', orderId: 77 }));
+  const again = await engine.receive(delivery({ type: 'order.created', orderId: 77 }));
+
+  assert.equal(first.eventId, 'order.created:77');
+  assert.equal(again.outcome, 'duplicate');
+  assert.equal(calls, 1);
+});
+
+test('a timestamp delivered in its own header is read from there and still signed', async () => {
+  const engine = engineWith(async () => 'ok', { timestampHeader: 'webhook-timestamp' });
+  const rawBody = JSON.stringify({ id: 'evt_21' });
+
+  const good = await engine.receive({
+    rawBody,
+    headers: {
+      'webhook-timestamp': String(SIGNED_AT),
+      'webhook-signature': `sha256=${signPayload({ rawBody, secret: SECRET, timestamp: SIGNED_AT })}`,
+    },
+  });
+  assert.equal(good.outcome, 'processed');
+
+  // Moving the header to escape the window invalidates the signature rather than the window.
+  const moved = await engine.receive({
+    rawBody,
+    headers: {
+      'webhook-timestamp': String(SIGNED_AT + 1),
+      'webhook-signature': `sha256=${signPayload({ rawBody, secret: SECRET, timestamp: SIGNED_AT })}`,
+    },
+  });
+  assert.equal(moved.status, 401);
+  assert.equal(moved.reason, 'no_matching_signature');
+});
+
+test('a base64 signing provider works end to end', async () => {
+  const engine = engineWith(async () => 'ok', { encoding: 'base64' });
+  const rawBody = JSON.stringify({ id: 'evt_22' });
+
+  const response = await engine.receive({
+    rawBody,
+    headers: {
+      'webhook-signature': signHeader({ rawBody, secret: SECRET, timestamp: SIGNED_AT, encoding: 'base64' }),
+    },
+  });
+  assert.equal(response.outcome, 'processed');
+});
+
+test('a custom signature header name is honoured', async () => {
+  const engine = engineWith(async () => 'ok', { signatureHeader: 'x-orbit-signature' });
+  const request = delivery({ id: 'evt_23' });
+
+  const wrongHeader = await engine.receive(request);
+  assert.equal(wrongHeader.reason, 'malformed_header', 'nothing is read from the default name');
+
+  const response = await engine.receive({
+    rawBody: request.rawBody,
+    headers: { 'x-orbit-signature': request.headers['webhook-signature'] },
+  });
+  assert.equal(response.outcome, 'processed');
 });

@@ -52,7 +52,7 @@ test('credential headers are redacted, and the signature header is not', () => {
   const record = buildDeadLetterRecord({
     ...BASE,
     headers: {
-      authorization: 'Bearer sk_live_notreal',
+      authorization: 'Bearer example-token-not-a-credential',
       cookie: 'session=abc',
       'x-api-key': 'key_notreal',
       'webhook-signature': 't=1614556800,v1=abc',

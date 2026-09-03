@@ -196,10 +196,20 @@ endpoint with an unsigned back door.
 raw bytes + headers
   → verify signature          reject: 401, nothing is stored
   → parse + extract event id  reject: 400, nothing is stored
-  → reserve idempotency key   duplicate: 200, handler never runs
+  → reserve idempotency key   already done: 200 duplicate, handler never runs
+                              still running: 409 in flight, handler never runs
   → retry(handler)            success: 200, key completed
   → dead letter               exhausted: 200, key released, record stored
+                              queue refused: 500, so the provider does redeliver
 ```
+
+**A duplicate that is still in flight gets 409, not 200.** The first delivery may still fail.
+Telling the provider "already done" while the work is unfinished is how an event disappears:
+the provider stops, the first attempt dies, and nothing is left holding the event.
+
+**The event id comes from the signed body before the header.** The HMAC covers the body and
+the timestamp and no other header, so an id read out of `webhook-id` is editable by anything on
+the request path. See section 7 for how this was found.
 
 Three of those orderings are decisions rather than accidents.
 
@@ -283,9 +293,9 @@ A record:
 
 ## 7. Verification posture
 
-Every mechanic here is a guard, and a guard that cannot fail is decoration. The precedent from
-the sibling repo in this portfolio is a first pass whose check shared a matcher with the thing
-it checked, so it passed on everything.
+Every mechanic here is a guard, and a guard that cannot fail is decoration. The failure mode
+being avoided is a check that shares a matcher with the thing it checks, so it passes on
+everything and reads as a green suite.
 
 So each of the four ships with at least one test where the naive implementation passes and the
 correct one fails:
@@ -302,5 +312,37 @@ correct one fails:
 | Retry | Delay never exceeds the cap, at attempt 3 and at attempt 30 |
 | DLQ | A dead-lettered record still verifies on replay, which a parsed body cannot |
 
-And the suite is mutation-checked before release: guards are deleted one at a time and the number
-of failing tests is recorded. A guard whose deletion turns nothing red is not guarded.
+### The mutation check, and what it found
+
+The suite is mutation-checked: thirty-two guards were deleted one at a time and the number of
+failing tests recorded. A guard whose deletion turns nothing red is not guarded. Twenty-eight
+mutations were caught. Four were not, and each one is worth stating rather than tidying away.
+
+1. **Replacing the constant-time comparison with `===` turned nothing red.** This is not
+   fixable by a better behavioural test. The two return the same boolean for every input and
+   differ only in how long they take, and that difference is not observable from inside the
+   process with any stability worth a CI job. The suite now carries a **source canary** that
+   fails if the primitive is swapped out, labelled in the test as what it is. It asserts the
+   intent of the code, not the behaviour of the compiled program.
+2. **Two mutations survived by hanging rather than failing.** A test had the second delivery's
+   response releasing the handler's gate, so a store that handed out the same key twice
+   deadlocked instead of asserting. A deadlocked run reports nothing at all, which is worse
+   than a missed guard because the suite looks like it is still working. The handler now
+   releases itself on a timer and the test asserts peak concurrency; both mutations then
+   produced clean failures.
+3. **Widening the retry loop's bound changed nothing**, because the `last` check inside the
+   loop still returns at the bound. Mutating that instead goes red. The duplication is
+   deliberate on a loop whose count is influenced by an authenticated but external party, and
+   it stays, with a comment saying which of the two lines is the one under test.
+
+### A defect this process found
+
+The default event id originally preferred the `webhook-id` header over the body. The HMAC
+covers the body and the timestamp and no other header, so that id is editable by anything on
+the request path. The same signed event could be re-presented under a fresh id and processed a
+second time, defeating deduplication without ever touching the signature. The signed body now
+decides and the header is the fallback. Where a provider binds the id into the signature — the
+Standard Webhooks scheme signs `${id}.${timestamp}.${body}` — the two agree and the ordering
+costs nothing.
+
+It was found by writing the adversarial test, not by reading the code.
