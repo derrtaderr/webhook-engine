@@ -229,3 +229,39 @@ test('a dead letter record assembled by hand from a parsed body is refused by th
   // And the builder refuses it one layer earlier, so neither route gets there.
   assert.throws(() => buildDeadLetterRecord(handRolled), /rawBody/);
 });
+
+test('a redelivery arriving while the dead letter is being written cannot start the handler again', async () => {
+  // The window between releasing the reservation and the record becoming durable. If the
+  // key is released first, the event is briefly covered by neither the reservation nor a
+  // record, and a duplicate that lands in that gap reserves cleanly and runs the handler a
+  // second time. The DLQ's push is the seam, so the redelivery is fired from inside it.
+  let handlerRuns = 0;
+  let secondOutcome = null;
+
+  const dlq = new MemoryDeadLetterQueue();
+  const push = dlq.push.bind(dlq);
+  let engine;
+  let fired = false;
+  dlq.push = async (record) => {
+    // The guard is set BEFORE the await. Setting it after lets the nested delivery's own
+    // dead letter re-enter this hook, and the test deadlocks instead of asserting.
+    if (!fired) {
+      fired = true;
+      secondOutcome = (await engine.receive(delivery(RAW))).outcome;
+    }
+    return push(record);
+  };
+
+  const RAW = JSON.stringify({ id: 'evt_race', type: 'payout.failed' });
+  engine = engineWith(
+    async () => {
+      handlerRuns += 1;
+      throw new Error('downstream down');
+    },
+    { dlq },
+  );
+
+  assert.equal((await engine.receive(delivery(RAW))).outcome, 'dead_lettered');
+  assert.equal(secondOutcome, 'in_flight', 'the duplicate must still see a reservation');
+  assert.equal(handlerRuns, 3, 'three attempts for the first delivery, and none for the second');
+});

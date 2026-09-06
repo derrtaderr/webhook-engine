@@ -201,12 +201,20 @@ export function createEngine({
       });
     }
 
-    // The key is released before the record is written, so a manual redelivery of a dead
-    // lettered event is allowed to run rather than being reported as a duplicate.
-    await store.release(id);
-
+    // THE RECORD BECOMES DURABLE BEFORE THE RESERVATION IS RELEASED.
+    //
+    // Releasing first leaves a window in which the event is covered by neither the
+    // reservation nor a record, and a duplicate delivery landing inside it reserves
+    // cleanly and runs the handler a second time while the first copy is still on its way
+    // to the queue. Pushing first means the cover is continuous: the reservation holds
+    // until a durable record replaces it.
+    //
+    // The release still happens, so the original reason for the old order survives — a
+    // manual redelivery of a dead lettered event is allowed to run rather than being
+    // refused as a duplicate.
+    let record;
     try {
-      const record = await dlq.push(
+      record = await dlq.push(
         buildDeadLetterRecord({
           eventId: id,
           rawBody: rawText,
@@ -217,16 +225,10 @@ export function createEngine({
           now: () => new Date(now()),
         }),
       );
-      return report({
-        status: 200,
-        outcome: 'dead_lettered',
-        eventId: id,
-        attempts: outcome.attempts,
-        dlqId: record.id,
-        errors: outcome.errors,
-      });
     } catch (error) {
-      // Nothing was stored, so the 200 above would have been a lie. Ask for a redelivery.
+      // Nothing was stored, so a 200 would have been a lie. Release the key so the
+      // provider's redelivery is allowed to run, and ask for one.
+      await store.release(id);
       return report({
         status: 500,
         outcome: 'dead_letter_failed',
@@ -234,6 +236,16 @@ export function createEngine({
         reason: error.message,
       });
     }
+
+    await store.release(id);
+    return report({
+      status: 200,
+      outcome: 'dead_lettered',
+      eventId: id,
+      attempts: outcome.attempts,
+      dlqId: record.id,
+      errors: outcome.errors,
+    });
   }
 
   /**
