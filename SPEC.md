@@ -349,3 +349,97 @@ Standard Webhooks scheme signs `${id}.${timestamp}.${body}` — the two agree an
 costs nothing.
 
 It was found by writing the adversarial test, not by reading the code.
+
+---
+
+## 8. Hardening pass 01 (2026-09-05)
+
+Four defects found by external review of the shipped 0.1.0 and confirmed against the source
+before any code was written. Each is real; the line references below were checked, not taken
+on the reviewer's word.
+
+**Prior art check.** The existing suite does not cover any of the four. `test/adversarial-engine.test.js:118`
+covers a redelivery arriving *during* the handler, which is a different window from the one in
+8.1. Buffer input is exercised only at the `verify.js` unit layer with valid UTF-8
+(`test/verify.test.js:91`), never end to end through engine → DLQ → replay. There is no timeout
+test because there is no timeout. So all four cycles start genuinely red.
+
+### 8.1 The dead letter write must be durable before the key is released
+
+`engine.js:206` releases the idempotency reservation, then `:209` pushes the record. Between
+those two lines the event is neither reserved nor safely stored: a duplicate delivery arriving
+in that window reserves successfully and starts the handler a second time, while the first
+request is still on its way to the DLQ.
+
+Corrected order: push the record, then release. The event is covered by the reservation right
+up until the moment it is covered by a durable record instead, and there is no instant where it
+is covered by neither.
+
+**The trap in the naive swap, and the decision.** The current ordering exists for a stated
+reason — the comment at `:205` wants a manual replay of a dead-lettered event to run rather
+than be refused as a duplicate. Pushing first preserves that, because the release still
+happens. But if `release()` itself throws after a successful push, the record is durable while
+the key stays `in_flight` for the full 24h TTL, and `replay()` inside that window returns 409
+instead of running. That is a regression to the very path the old ordering protected.
+
+Decision: **once the record is durable, a failed release is not fatal to the response.** The
+event is safe, responsibility has transferred, and the reply stays 200. The failure is reported
+on the result object as `releaseFailed` so an operator can see the key will be stuck until TTL,
+rather than discovering it at replay time. A push failure still inverts the status to 500, as
+it does today.
+
+### 8.2 The handler needs a timeout, not just a retry count
+
+`retry.js:114` is a bare `await fn(attempt)`. It handles a handler that rejects. It cannot
+handle a handler that never settles, and a hung handler hangs the whole `receive()` forever:
+the key stays reserved, the retry never fires, the DLQ record is never written, and the
+connection is held open indefinitely. The 24h reservation TTL eventually lets another delivery
+claim the key, but that is recovery from an abandoned reservation, not handler-timeout
+semantics.
+
+`retry` gains `timeoutMs`. A handler that exceeds it is treated as a failed attempt — the error
+record says so, backoff and the attempt bound apply as normal, and exhaustion dead-letters as
+any other permanent failure. The handler receives an `AbortSignal` so cooperative work can stop
+rather than continue in the background after the engine has moved on.
+
+Default: `timeoutMs: 10_000`. A tagline that promises survival of a flaky handler has to include
+the handler that hangs, which is the most common shape of a dependency outage.
+
+### 8.3 The dead letter record must hold bytes, not a decoded string
+
+`engine.js:164` decodes a Buffer body to a UTF-8 string and `dlq.js:105` stores that string.
+HMAC verification itself is byte-correct (`verify.js` `toBytes` keeps the Buffer intact), so the
+split is narrow but real: for a body that is not valid UTF-8, `Buffer → string → Buffer` does
+not reconstruct the original bytes, and the record fails verification on replay. That failure
+lands at the exact moment the DLQ exists to serve, during recovery.
+
+Reachability is low, because JSON is required to be UTF-8 and no conforming provider sends
+anything else. The reason to fix it now anyway is that the record is a persisted, user-visible
+format. At 0.1.0 with an in-memory default queue, changing its shape costs nothing. After
+anyone runs a durable DLQ in production it costs a migration.
+
+The record gains `rawBodyBase64`, and replay reconstructs the exact bytes from it. `rawBody`
+stays for readability and for records already in flight.
+
+This is the same failure class the suite already tests in another form — §7's counterfactual,
+that a signature valid over the raw bytes fails over a `JSON.parse`/`stringify` round trip. The
+project knew this shape and shipped a second instance of it.
+
+### 8.4 The README's retry-duration claim
+
+README:323 says four attempts can hold a connection "for around a minute and a half of wall
+clock." With the defaults (`attempts: 4, baseMs: 250, factor: 2`, full jitter) there are three
+waits of at most 250, 500 and 1000ms, so the backoff totals at most 1.75s and averages nearer
+875ms.
+
+This is not an independent item. It is 8.2 seen from the documentation side: the sentence
+asserts a wall-clock bound, and with no handler timeout the honest answer is *unbounded*, not
+90 seconds and not 1.75s. Correcting the number alone would state a tight bound for a request
+that can in fact hang forever. So 8.2 lands first and this sentence is then rewritten to a
+number the code actually guarantees — `attempts × timeoutMs` plus backoff, 41.75s at the
+defaults.
+
+### Out of scope
+
+The reviewer's positioning suggestion ("a fail-closed webhook ingestion engine") is a README
+and package-description change with no code behind it. It is not part of this pass.
