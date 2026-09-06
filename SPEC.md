@@ -166,6 +166,16 @@ against a storm.
 **Non-retryable errors.** An error carrying `retryable: false` stops immediately. Retrying a
 validation failure four times is four times the load for the same answer.
 
+**Why a bound on time and not only on count** (added by hardening pass 01, see section 8.2). An
+attempt count bounds a handler that rejects. It does nothing for a handler that never settles,
+and that handler holds the retry loop open forever: no retry, no dead letter, no response, and
+the idempotency key reserved the whole time. The reservation TTL eventually frees the key, but
+that is recovery from an abandonment, not a timeout. Each attempt is therefore raced against
+`timeoutMs`, a hang counts as an ordinary failed attempt, and the handler is handed an
+`AbortSignal` so cooperative work stops instead of continuing against a dependency the engine
+has already given up on. A handler that ignores its signal is abandoned rather than stopped,
+which is a limit of cooperative cancellation and is stated as one.
+
 ### 3.4 Dead letter queue
 
 **Why it is required.** After the last attempt, the event is either recorded somewhere
@@ -184,6 +194,14 @@ convenient thing to store is the parsed object. It is smaller, it is readable in
 it silently destroys replayability. The test exists so that convenience cannot be taken later
 without a red suite.
 
+**"As bytes" has to mean bytes** (added by hardening pass 01, see section 8.3). Storing the
+UTF-8 decoded string satisfies the paragraph above for every ordinary body and fails for one
+that is not valid UTF-8, because `Buffer -> string -> Buffer` does not reconstruct what was
+signed. The record therefore carries `rawBodyBase64` as well, and replay reconstructs from it.
+`rawBody` stays for readability. The first version of this spec asserted the guarantee and the
+first version of the suite tested it with a string body, so the claim and its test agreed with
+each other and both were narrower than the sentence they shared.
+
 Replay does not bypass the replay window. A record dead-lettered a week ago will fail its
 timestamp tolerance on replay, and that is correct — the operator replaying it is deciding to
 reprocess, so they pass `skipVerification` explicitly and that decision is visible in the code
@@ -199,8 +217,9 @@ raw bytes + headers
   → reserve idempotency key   already done: 200 duplicate, handler never runs
                               still running: 409 in flight, handler never runs
   → retry(handler)            success: 200, key completed
-  → dead letter               exhausted: 200, key released, record stored
-                              queue refused: 500, so the provider does redeliver
+                              each attempt bounded by timeoutMs, a hang is a failed attempt
+  → dead letter               exhausted: 200, record stored FIRST, then key released
+                              queue refused: 500, key released, so the provider does redeliver
 ```
 
 **A duplicate that is still in flight gets 409, not 200.** The first delivery may still fail.
@@ -229,8 +248,14 @@ disabled — while a perfectly good copy of the event is already sitting in the 
 Getting this backwards produces an outage where the provider's own retry logic amplifies a
 handler bug into a delivery storm.
 
-The idempotency key is **released** on dead-lettering, so a manual redelivery of the same event
-is allowed to run rather than being reported as a duplicate.
+**The record becomes durable before the key is released** (corrected by hardening pass 01, see
+section 8.1). The key is still released on dead-lettering, so a manual redelivery of the same
+event is allowed to run rather than being reported as a duplicate. But releasing first left a
+window in which the event was covered by neither the reservation nor a record, and a duplicate
+arriving inside it reserved cleanly and ran the handler a second time. Pushing first makes the
+cover continuous. If the release then fails the status stays 200, because the record exists and
+the event is safe, and the result carries `releaseFailed` so the stuck key is visible before a
+replay is refused by it.
 
 ## 5. The storage interfaces
 
