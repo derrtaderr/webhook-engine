@@ -313,3 +313,44 @@ test('a handler that hangs is dead lettered rather than holding the connection o
   );
   assert.match((await engine.dlq.list())[0].errors[0].message, /timed out after 10ms/);
 });
+
+test('a dead lettered record replays byte for byte when the body is not valid UTF-8', { timeout: 2000 }, async () => {
+  // The DLQ's whole purpose is replay, and replay re-verifies. Decoding the body to a
+  // string on the way in makes `Buffer -> string -> Buffer` lossy for anything that is not
+  // valid UTF-8: the bytes that come back out are not the bytes that were signed, so the
+  // record fails verification at exactly the moment it exists to be used.
+  //
+  // The suite's existing replay counterfactual uses a string body, so it passes either
+  // way. This is the input shape that separates them.
+  const rawBody = Buffer.concat([
+    Buffer.from('{"id":"evt_bytes","note":"'),
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from('"}'),
+  ]);
+  assert.notDeepEqual(
+    Buffer.from(rawBody.toString('utf8'), 'utf8'),
+    rawBody,
+    'the fixture has to actually survive the round trip badly, or it proves nothing',
+  );
+
+  const request = {
+    rawBody,
+    headers: {
+      'content-type': 'application/json',
+      'webhook-signature': signHeader({ rawBody, secret: SECRET, timestamp: SIGNED_AT }),
+    },
+  };
+
+  let failing = true;
+  const engine = engineWith(async () => {
+    if (failing) throw new Error('downstream down');
+    return 'replayed';
+  });
+
+  assert.equal((await engine.receive(request)).outcome, 'dead_lettered');
+  const [record] = await engine.dlq.list();
+
+  failing = false;
+  const response = await engine.replay(record.id);
+  assert.equal(response.outcome, 'processed', 'the stored record must still verify');
+});

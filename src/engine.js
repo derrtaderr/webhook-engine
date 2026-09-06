@@ -161,6 +161,7 @@ export function createEngine({
       return report({ status: 401, outcome: 'rejected', reason: 'no_raw_body' });
     }
 
+    const rawBytes = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), 'utf8');
     const rawText = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
 
     let body = rawText;
@@ -220,6 +221,7 @@ export function createEngine({
         buildDeadLetterRecord({
           eventId: id,
           rawBody: rawText,
+          rawBodyBase64: rawBytes.toString('base64'),
           headers: Object.fromEntries(lower),
           attempts: outcome.attempts,
           errors: outcome.errors,
@@ -275,10 +277,14 @@ export function createEngine({
     const record = typeof recordOrId === 'string' ? await dlq.get(recordOrId) : recordOrId;
     if (!record) return report({ status: 404, outcome: 'not_found' });
 
-    const response = await receive(
-      { rawBody: record.rawBody, headers: record.headers },
-      { skipVerification },
-    );
+    // The bytes, not the decoded string, or a body that was not valid UTF-8 fails the
+    // verification it passed on the way in.
+    const replayBody =
+      typeof record.rawBodyBase64 === 'string'
+        ? Buffer.from(record.rawBodyBase64, 'base64')
+        : record.rawBody;
+
+    const response = await receive({ rawBody: replayBody, headers: record.headers }, { skipVerification });
 
     // Drained only on a real success. A refused replay leaves the record where it was.
     if (response.outcome === 'processed') await dlq.remove(record.id);
