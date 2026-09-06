@@ -37,7 +37,7 @@
 import { verifySignature } from './verify.js';
 import { MemoryIdempotencyStore } from './idempotency.js';
 import { MemoryDeadLetterQueue, buildDeadLetterRecord } from './dlq.js';
-import { retry as retryFn, DEFAULT_RETRY } from './retry.js';
+import { retry as retryFn, resolveRetryConfig } from './retry.js';
 
 export const DEFAULT_SIGNATURE_HEADER = 'webhook-signature';
 export const DEFAULT_ID_HEADER = 'webhook-id';
@@ -115,7 +115,10 @@ export function createEngine({
   assertStore(store);
   assertDlq(dlq);
 
-  const retryConfig = { ...DEFAULT_RETRY, ...retryOptions, ...(sleep ? { sleep } : {}) };
+  // Resolved and validated HERE, not on the first delivery. See SPEC.md section 9.1: a
+  // throw from inside retry() lands after the key is reserved and before anything that
+  // could release it, which strands the event for a full TTL instead of failing a boot.
+  const retryConfig = resolveRetryConfig({ ...retryOptions, ...(sleep ? { sleep } : {}) });
 
   // THE SIGNED BODY DECIDES, AND THE HEADER IS ONLY A FALLBACK.
   //

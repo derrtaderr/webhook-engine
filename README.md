@@ -268,9 +268,12 @@ createEngine({
 ```
 
 The signal is cooperative. A handler that ignores it is abandoned rather than stopped, so
-pass it to anything that accepts one. `timeoutMs: null` disables the bound deliberately;
-a negative or NaN value is refused at construction, because a bound that silently does not
-apply is the failure the option exists to prevent.
+pass it to anything that accepts one. `timeoutMs: null` disables the bound deliberately; a
+negative or NaN value throws from `createEngine`, before the endpoint ever accepts a
+delivery, because a bound that silently does not apply is the failure the option exists to
+prevent. Every retry option is checked there, for the same reason the secret is: a
+misconfigured deployment should cost you a failed boot, not a day of events stranded behind
+a reservation nothing will clear.
 
 ### Dead letter queue
 

@@ -149,9 +149,26 @@ const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * @returns {Promise<{ok: true, result: unknown, attempts: number, errors: object[]}
  *                  |{ok: false, attempts: number, errors: object[]}>}
  */
-export async function retry(fn, options = {}) {
+/**
+ * Merge and validate retry options once, so a misconfigured deployment fails at boot.
+ *
+ * Validating inside `retry()` instead meant the throw landed on the first delivery, and
+ * by then the idempotency key was already reserved — with nothing to catch the error and
+ * nothing left to release it. The key stayed in flight for its whole TTL and every
+ * redelivery answered 409 while the dead letter queue stayed empty. A configuration
+ * mistake should cost a failed boot, never a day of silently stranded events.
+ */
+export function resolveRetryConfig(options = {}) {
   const config = { ...DEFAULT_RETRY, random: Math.random, ...options };
   validate(config);
+  return config;
+}
+
+export async function retry(fn, options = {}) {
+  // Still validated here. The engine resolves at construction, but `retry` is exported
+  // and can be called directly, and a bound that applies only when someone else checked
+  // it first is not a bound.
+  const config = resolveRetryConfig(options);
 
   const { attempts, timeoutMs, sleep = defaultSleep, shouldRetry, onAttempt } = config;
   const errors = [];
