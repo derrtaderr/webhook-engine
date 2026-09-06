@@ -242,12 +242,23 @@ export function createEngine({
     } catch (error) {
       // Nothing was stored, so a 200 would have been a lie. Release the key so the
       // provider's redelivery is allowed to run, and ask for one.
-      await store.release(id);
+      //
+      // A CLEANUP INSIDE A FAILURE PATH MUST NOT REPLACE THE FAILURE IT IS CLEANING UP
+      // AFTER. If this release throws too, letting it propagate hands the caller an
+      // exception instead of a status, and the dead letter failure it was reacting to
+      // never gets reported at all. Both are real states and the response carries both.
+      let releaseFailed;
+      try {
+        await store.release(id);
+      } catch (releaseError) {
+        releaseFailed = releaseError.message;
+      }
       return report({
         status: 500,
         outcome: 'dead_letter_failed',
         eventId: id,
         reason: error.message,
+        ...(releaseFailed === undefined ? {} : { releaseFailed }),
       });
     }
 

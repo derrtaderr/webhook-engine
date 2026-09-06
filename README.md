@@ -304,6 +304,12 @@ instant where the event is covered by neither. If the release then fails, the re
 result carries `releaseFailed`. The key stays claimed until its TTL, which means a replay
 inside that window is refused as `in_flight`, so the field is worth logging.
 
+`releaseFailed` appears on the 500 path too. If the queue refuses the record *and* the
+release then fails, the status stays 500 — nothing was stored, so the provider should
+redeliver — and both failures are reported: `reason` is the queue's, `releaseFailed` is the
+store's. A cleanup running inside a failure path must never replace the failure it was
+cleaning up after.
+
 A full queue **throws** rather than evicting. Every other buffer here drops its oldest
 entry; this one holds the events that already failed everywhere else.
 

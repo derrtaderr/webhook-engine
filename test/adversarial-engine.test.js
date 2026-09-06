@@ -354,3 +354,32 @@ test('a dead lettered record replays byte for byte when the body is not valid UT
   const response = await engine.replay(record.id);
   assert.equal(response.outcome, 'processed', 'the stored record must still verify');
 });
+
+test('a DLQ that refuses and a store that will not release still produce a response', async () => {
+  // Both cleanup steps failing at once. The 500 is still right, because nothing was
+  // stored and the provider genuinely should redeliver. What must not happen is the
+  // release's own error replacing the failure it was cleaning up after, leaving the
+  // caller with an exception instead of a status.
+  const store = new MemoryIdempotencyStore();
+  store.release = async () => {
+    throw new Error('store unreachable');
+  };
+  const dlq = new MemoryDeadLetterQueue();
+  dlq.push = async () => {
+    throw new Error('queue refused the record');
+  };
+
+  const engine = engineWith(
+    async () => {
+      throw new Error('downstream down');
+    },
+    { store, dlq },
+  );
+
+  const response = await engine.receive(delivery({ id: 'evt_both_fail', type: 'payout.failed' }));
+
+  assert.equal(response.status, 500, 'nothing was stored, so ask for a redelivery');
+  assert.equal(response.outcome, 'dead_letter_failed');
+  assert.equal(response.reason, 'queue refused the record', 'the original failure, not the cleanup');
+  assert.equal(response.releaseFailed, 'store unreachable', 'and the stuck key is visible');
+});
