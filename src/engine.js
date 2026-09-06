@@ -237,7 +237,17 @@ export function createEngine({
       });
     }
 
-    await store.release(id);
+    // The record is durable, so the event is safe and the 200 is honest whatever happens
+    // next. A release that fails here costs a key stuck until its TTL, and a replay
+    // refused as in flight until then — worth reporting, not worth inverting a truthful
+    // status over.
+    let releaseFailed;
+    try {
+      await store.release(id);
+    } catch (error) {
+      releaseFailed = error.message;
+    }
+
     return report({
       status: 200,
       outcome: 'dead_lettered',
@@ -245,6 +255,7 @@ export function createEngine({
       attempts: outcome.attempts,
       dlqId: record.id,
       errors: outcome.errors,
+      ...(releaseFailed === undefined ? {} : { releaseFailed }),
     });
   }
 

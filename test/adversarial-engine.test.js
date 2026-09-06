@@ -265,3 +265,27 @@ test('a redelivery arriving while the dead letter is being written cannot start 
   assert.equal(secondOutcome, 'in_flight', 'the duplicate must still see a reservation');
   assert.equal(handlerRuns, 3, 'three attempts for the first delivery, and none for the second');
 });
+
+test('a release that fails after the record is durable does not turn a truthful 200 into an error', async () => {
+  // Once the record exists the event is safe and responsibility has transferred, so the
+  // 200 is honest. The cost of the failed release is a key stuck until its TTL, which the
+  // operator needs told rather than discovering it when a replay is refused.
+  const store = new MemoryIdempotencyStore();
+  store.release = async () => {
+    throw new Error('store unreachable');
+  };
+
+  const engine = engineWith(
+    async () => {
+      throw new Error('downstream down');
+    },
+    { store },
+  );
+
+  const response = await engine.receive(delivery({ id: 'evt_release_fail', type: 'payout.failed' }));
+
+  assert.equal(response.status, 200);
+  assert.equal(response.outcome, 'dead_lettered');
+  assert.equal(response.releaseFailed, 'store unreachable');
+  assert.equal((await engine.dlq.list()).length, 1, 'the record is what makes the 200 honest');
+});
