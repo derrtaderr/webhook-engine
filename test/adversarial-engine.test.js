@@ -289,3 +289,27 @@ test('a release that fails after the record is durable does not turn a truthful 
   assert.equal(response.releaseFailed, 'store unreachable');
   assert.equal((await engine.dlq.list()).length, 1, 'the record is what makes the 200 honest');
 });
+
+test('a handler that hangs is dead lettered rather than holding the connection open', { timeout: 2000 }, async () => {
+  // End to end, the failure retry.js gained a bound for. Without it this delivery never
+  // returns at all: no retry, no record, no response, and the key reserved the whole time.
+  const signals = [];
+  const engine = engineWith(
+    (event, { signal }) =>
+      new Promise(() => {
+        signals.push(signal);
+      }),
+    { retry: { attempts: 2, baseMs: 1, maxMs: 5, timeoutMs: 10 } },
+  );
+
+  const response = await engine.receive(delivery({ id: 'evt_hang', type: 'payout.failed' }));
+
+  assert.equal(response.outcome, 'dead_lettered');
+  assert.equal(response.attempts, 2);
+  assert.equal(signals.length, 2, 'the handler is reached on both attempts');
+  assert.ok(
+    signals.every((signal) => signal.aborted),
+    'every abandoned attempt aborts its own signal',
+  );
+  assert.match((await engine.dlq.list())[0].errors[0].message, /timed out after 10ms/);
+});

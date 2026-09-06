@@ -62,7 +62,7 @@ function assertDlq(dlq) {
 /**
  * @param {object} options
  * @param {string|string[]} options.secret signing key, or several during a rotation
- * @param {(event: {id: string, body: unknown, rawBody: string, headers: object}) => Promise<unknown>} options.handler
+ * @param {(event: {id: string, body: unknown, rawBody: string, headers: object}, context: {signal: AbortSignal}) => Promise<unknown>} options.handler
  * @param {object} [options.store] idempotency store, default in-memory
  * @param {object} [options.dlq] dead letter queue, default in-memory
  * @param {object} [options.retry] retry options, see DEFAULT_RETRY
@@ -188,7 +188,9 @@ export function createEngine({
     }
 
     const event = { id, body, rawBody: rawText, headers: Object.fromEntries(lower) };
-    const outcome = await retryFn(() => handler(event), retryConfig);
+    // The attempt's context carries the AbortSignal, so a handler can stop its own work
+    // when the engine stops waiting for it.
+    const outcome = await retryFn((attempt, context) => handler(event, context), retryConfig);
 
     if (outcome.ok) {
       await store.complete(id, outcome.result);
