@@ -198,7 +198,14 @@ test('onAttempt observes every failure with its attempt number and the wait that
 });
 
 test('the defaults are stated once and are the ones documented', () => {
-  assert.deepEqual(DEFAULT_RETRY, { attempts: 4, baseMs: 250, maxMs: 30_000, factor: 2, jitter: true });
+  assert.deepEqual(DEFAULT_RETRY, {
+    attempts: 4,
+    baseMs: 250,
+    maxMs: 30_000,
+    factor: 2,
+    jitter: true,
+    timeoutMs: 10_000,
+  });
 });
 
 test('nonsense configuration is refused instead of quietly becoming a single attempt', async () => {
@@ -219,4 +226,54 @@ test('nonsense configuration is refused instead of quietly becoming a single att
       JSON.stringify(bad),
     );
   }
+});
+
+test('a handler that never settles is abandoned at the timeout and counts as a failed attempt', { timeout: 2000 }, async () => {
+  // The failure retry could not previously see. A rejection is handled; a promise that
+  // never settles held the loop open forever, so the retry never fired, the dead letter
+  // was never written, and the connection stayed open with the key reserved.
+  const { sleep } = recordingSleep();
+
+  const outcome = await retry(() => new Promise(() => {}), { attempts: 2, timeoutMs: 10, sleep });
+
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.attempts, 2, 'a timeout is a failed attempt, so the bound still applies');
+  assert.equal(outcome.errors.length, 2);
+  assert.match(outcome.errors[0].message, /timed out after 10ms/);
+});
+
+test('the handler is given a signal that aborts when its attempt times out', { timeout: 2000 }, async () => {
+  // Abandoning the promise is not enough on its own. Without a signal the work carries on
+  // in the background against a dependency the engine has already given up on.
+  const seen = [];
+
+  await retry(
+    (attempt, { signal }) =>
+      // Records the abort and never settles. Resolving here would make the attempt a
+      // success, the loop would return after the first one, and the test would be
+      // asserting the opposite of what it claims.
+      new Promise(() => {
+        signal.addEventListener('abort', () => void seen.push(attempt));
+      }),
+    { attempts: 2, timeoutMs: 10, sleep: async () => {} },
+  );
+
+  assert.deepEqual(seen, [1, 2], 'every timed-out attempt aborts its own signal');
+});
+
+test('a handler that settles in time is never aborted', { timeout: 2000 }, async () => {
+  let aborted = false;
+
+  const outcome = await retry(
+    async (attempt, { signal }) => {
+      signal.addEventListener('abort', () => {
+        aborted = true;
+      });
+      return 'ok';
+    },
+    { attempts: 2, timeoutMs: 50, sleep: async () => {} },
+  );
+
+  assert.equal(outcome.ok, true);
+  assert.equal(aborted, false, 'a successful attempt must not leave an aborted signal behind');
 });
