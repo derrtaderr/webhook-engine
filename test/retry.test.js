@@ -277,3 +277,26 @@ test('a handler that settles in time is never aborted', { timeout: 2000 }, async
   assert.equal(outcome.ok, true);
   assert.equal(aborted, false, 'a successful attempt must not leave an aborted signal behind');
 });
+
+test('the README states the wall clock bound the defaults actually produce', async () => {
+  // The old sentence claimed around a minute and a half from four attempts, which the
+  // backoff alone never reaches — three waits of at most 250, 500 and 1000ms. It was also
+  // the wrong kind of claim, because with no handler bound the honest answer was
+  // unbounded. Now that the bound exists the number is derivable, so it is derived here
+  // rather than written down twice and left to drift.
+  const { readFile } = await import('node:fs/promises');
+  const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
+
+  const { attempts, baseMs, factor, maxMs, timeoutMs } = DEFAULT_RETRY;
+  let backoffMs = 0;
+  for (let attempt = 1; attempt < attempts; attempt += 1) {
+    backoffMs += Math.min(maxMs, baseMs * factor ** (attempt - 1));
+  }
+  const worstCaseSeconds = ((attempts * timeoutMs + backoffMs) / 1000).toFixed(2);
+
+  assert.match(
+    readme,
+    new RegExp(`${worstCaseSeconds} seconds`),
+    `README must state the ${worstCaseSeconds}s bound the defaults produce`,
+  );
+});
