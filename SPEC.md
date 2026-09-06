@@ -468,3 +468,26 @@ defaults.
 
 The reviewer's positioning suggestion ("a fail-closed webhook ingestion engine") is a README
 and package-description change with no code behind it. It is not part of this pass.
+
+### The mutation check for hardening pass 01
+
+Same question as the original run: remove the safety property, and does a test notice? Each
+guard added by this pass was reverted in turn against the full suite.
+
+| Mutation | Failures | Caught by |
+|---|---|---|
+| Release the key before the DLQ push, as 0.1.0 did | 2 | the redelivery-in-the-window test, and the failed-release test |
+| Drop the timeout race, awaiting the handler directly | 3 | both retry timeout tests, and the hung-handler test through the engine |
+| Replay from `rawBody` instead of the stored bytes | 1 | the non-UTF-8 replay test |
+
+Each mutation was caught by the test written for it and by nothing else spurious, and the
+suite returns to 137 passing when restored.
+
+Worth recording honestly, because it is the more useful finding: the original mutation run
+scored 31 of 32 and did not surface any of these three. A mutation check answers "does a test
+notice when this guard is removed." It cannot answer "is there a guard here at all." Two of
+these three were absent properties rather than weak ones — there was no timeout to delete and
+no byte store to corrupt — and the third was an ordering, which mutation testing does not
+enumerate. The technique bounds the tests that exist; it says nothing about the ones nobody
+wrote. That gap is what an outside reader found, and it is the argument for review alongside
+the harness rather than in place of it.
