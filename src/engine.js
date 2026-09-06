@@ -6,9 +6,11 @@
  *     → parse + extract event id  reject: 400, nothing is stored
  *     → reserve idempotency key   duplicate: 200, in flight: 409, handler never runs
  *     → retry(handler)            success: 200, key completed
- *     → dead letter               exhausted: 200, key released, record stored
+ *                                 each attempt bounded by timeoutMs, a hang is a failure
+ *     → dead letter               exhausted: 200, record stored FIRST, then key released
+ *                                 queue refused: 500, key released, so the provider retries
  *
- * Three of those orderings are decisions rather than accidents.
+ * Four of those orderings are decisions rather than accidents.
  *
  * VERIFICATION COMES BEFORE PARSING. Parsing attacker-controlled bytes is attack
  * surface, and an unverified sender should not get to exercise the JSON parser or
@@ -25,6 +27,11 @@
  * event is already sitting in the DLQ. The 200 means responsibility has been taken, and
  * it is only honest because the record exists — so when the DLQ refuses the record, the
  * status inverts to 500 and the provider is asked to redeliver after all.
+ *
+ * THE RECORD IS DURABLE BEFORE THE KEY IS RELEASED. Releasing first leaves a window in
+ * which the event is covered by neither the reservation nor a record, and a duplicate
+ * arriving inside it reserves cleanly and runs the handler a second time. The key is
+ * still released, so a manual replay is allowed to run; it just happens second.
  */
 
 import { verifySignature } from './verify.js';
