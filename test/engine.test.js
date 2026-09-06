@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { createEngine } from '../src/engine.js';
 import { signHeader, signPayload } from '../src/verify.js';
 import { MemoryDeadLetterQueue } from '../src/dlq.js';
+import { MemoryIdempotencyStore } from '../src/idempotency.js';
 
 const SECRET = 'whsec_fixture';
 const SIGNED_AT = 1614556800;
@@ -379,4 +380,34 @@ test('a custom signature header name is honoured', async () => {
     headers: { 'x-orbit-signature': request.headers['webhook-signature'] },
   });
   assert.equal(response.outcome, 'processed');
+});
+
+test('a bad retry config is refused at construction, before any key can be reserved', () => {
+  // The failure this prevents is not a late throw, it is a stranded reservation. The
+  // old order let construction succeed, then threw inside retry() on the first
+  // delivery — after the key was reserved and before any path that releases it. The
+  // key then sat in_flight for its whole TTL and every redelivery answered 409.
+  assert.throws(
+    () => createEngine({ secret: SECRET, handler: async () => 'ok', retry: { timeoutMs: -1 } }),
+    /timeoutMs/,
+  );
+  assert.throws(
+    () => createEngine({ secret: SECRET, handler: async () => 'ok', retry: { attempts: 0 } }),
+    /attempts/,
+  );
+});
+
+test('a valid engine never strands a reservation on a config error, because there is none left to hit', async () => {
+  // The other half of the same claim: construction having passed, a delivery reaches
+  // the handler and the key reaches a terminal state.
+  const store = new MemoryIdempotencyStore();
+  const engine = createEngine({
+    secret: SECRET,
+    handler: async () => 'ok',
+    store,
+    retry: { attempts: 2, timeoutMs: 50, baseMs: 1, maxMs: 5 },
+    now: () => NOW,
+  });
+  assert.equal((await engine.receive(delivery({ id: 'evt_boot', type: 'ok' }))).outcome, 'processed');
+  assert.equal((await store.reserve('evt_boot')).state, 'done');
 });

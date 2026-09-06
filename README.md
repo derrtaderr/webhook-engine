@@ -268,9 +268,12 @@ createEngine({
 ```
 
 The signal is cooperative. A handler that ignores it is abandoned rather than stopped, so
-pass it to anything that accepts one. `timeoutMs: null` disables the bound deliberately;
-a negative or NaN value is refused at construction, because a bound that silently does not
-apply is the failure the option exists to prevent.
+pass it to anything that accepts one. `timeoutMs: null` disables the bound deliberately; a
+negative or NaN value throws from `createEngine`, before the endpoint ever accepts a
+delivery, because a bound that silently does not apply is the failure the option exists to
+prevent. Every retry option is checked there, for the same reason the secret is: a
+misconfigured deployment should cost you a failed boot, not a day of events stranded behind
+a reservation nothing will clear.
 
 ### Dead letter queue
 
@@ -300,6 +303,12 @@ instant where the event is covered by neither. If the release then fails, the re
 200 — the record exists, so the event is safe and responsibility has transferred — and the
 result carries `releaseFailed`. The key stays claimed until its TTL, which means a replay
 inside that window is refused as `in_flight`, so the field is worth logging.
+
+`releaseFailed` appears on the 500 path too. If the queue refuses the record *and* the
+release then fails, the status stays 500 — nothing was stored, so the provider should
+redeliver — and both failures are reported: `reason` is the queue's, `releaseFailed` is the
+store's. A cleanup running inside a failure path must never replace the failure it was
+cleaning up after.
 
 A full queue **throws** rather than evicting. Every other buffer here drops its oldest
 entry; this one holds the events that already failed everywhere else.

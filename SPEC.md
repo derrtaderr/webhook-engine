@@ -491,3 +491,59 @@ no byte store to corrupt — and the third was an ordering, which mutation testi
 enumerate. The technique bounds the tests that exist; it says nothing about the ones nobody
 wrote. That gap is what an outside reader found, and it is the argument for review alongside
 the harness rather than in place of it.
+
+---
+
+## 9. Boot-and-double-failure pass (2026-09-06)
+
+Two defects from a second review of the merged hardening pass. Both are in the class the
+hardening pass was supposedly about: a stated guarantee the code does not provide, and a failure
+path that leaves the system in a state the response cannot describe.
+
+### 9.1 Retry configuration is not validated at construction, and the README says it is
+
+`README.md:272` states that a negative or NaN `timeoutMs` is "refused at construction." It is
+not. `engine.js:118` spreads the retry options into a config object and validates nothing;
+`validate()` runs inside `retry()` at `retry.js:154`, on the first delivery.
+
+**The consequence is worse than a late throw.** Trace `createEngine({ retry: { timeoutMs: -1 } })`
+against a genuine delivery:
+
+```
+verify signature      passes
+parse + event id      passes
+reserve key           SUCCEEDS
+retry(handler)        validate() throws TypeError
+                      nothing in receive() catches it
+                      it propagates out of the engine
+```
+
+The key is now neither completed nor released. It sits `in_flight` for its full 24h TTL, so
+every redelivery of that event is answered 409 for a day, the handler never runs, and the dead
+letter queue stays empty while the events pile up behind a reservation nobody will clear. One
+misconfigured deploy poisons every event it touches, silently.
+
+This is the exact invariant section 4 claims for the rest of the configuration: a misconfigured
+deployment fails at boot rather than at the first delivery. Retry was the one part left outside
+it. `resolveRetryConfig` moves the validation to construction and the README statement becomes
+true rather than aspirational.
+
+**Recorded plainly, because it is the same mistake twice.** The hardening pass corrected a
+different false README claim about retry duration, and wrote a spec section arguing that a
+README asserting a bound the code does not provide is itself the defect. Then it added this one,
+in the same pass, four paragraphs further down the same file.
+
+### 9.2 A failed release inside the dead-letter-failure path escapes the response
+
+`engine.js:242`. When `dlq.push` throws, the handler releases the key and returns 500 so the
+provider redelivers. If that release also throws, the exception propagates and the caller gets
+neither the documented `dead_letter_failed` response nor any status at all.
+
+Both failures are real states and the response should carry both. The status stays 500, because
+nothing was stored and the provider genuinely should retry. `releaseFailed` joins it, the same
+field 8.1 added to the success path, so the stuck key is visible rather than discovered later by
+a redelivery that mysteriously 409s.
+
+The general rule this pass makes explicit, since the same shape has now appeared twice: **a
+cleanup that runs inside a failure path must not be able to replace the failure it was cleaning
+up after.**
