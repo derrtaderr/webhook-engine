@@ -33,9 +33,54 @@ export const DEFAULT_RETRY = Object.freeze({
   maxMs: 30_000,
   factor: 2,
   jitter: true,
+  timeoutMs: 10_000,
 });
 
-function validate({ attempts, baseMs, maxMs, factor }) {
+/**
+ * A handler that exceeded its attempt's time bound. Carries `timeout: true` so a
+ * `shouldRetry` classifier can tell a hang apart from a rejection.
+ */
+export class HandlerTimeoutError extends Error {
+  constructor(timeoutMs) {
+    super(`webhook-engine: handler timed out after ${timeoutMs}ms`);
+    this.name = 'HandlerTimeoutError';
+    this.timeout = true;
+  }
+}
+
+/**
+ * One invocation, bounded.
+ *
+ * Racing the handler against a timer is what makes the hang visible; aborting the signal
+ * is what stops the work continuing against a dependency the engine has already given up
+ * on. Both are needed, and only the first is enforceable — a handler that ignores its
+ * signal is abandoned rather than stopped, which is said plainly in the README.
+ *
+ * The timer is always cleared, including on the winning path, or a fast handler leaves a
+ * pending timer behind for the length of the timeout.
+ */
+async function runAttempt(fn, attempt, timeoutMs) {
+  const controller = new AbortController();
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return fn(attempt, { signal: controller.signal });
+  }
+
+  let timer;
+  const expiry = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new HandlerTimeoutError(timeoutMs));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([fn(attempt, { signal: controller.signal }), expiry]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function validate({ attempts, baseMs, maxMs, factor, timeoutMs }) {
   if (!Number.isInteger(attempts) || attempts < 1) {
     throw new TypeError('webhook-engine: retry attempts must be a whole number of at least 1.');
   }
@@ -47,6 +92,13 @@ function validate({ attempts, baseMs, maxMs, factor }) {
   }
   if (!Number.isFinite(factor) || factor < 1) {
     throw new TypeError('webhook-engine: retry factor must be at least 1, or the backoff shrinks.');
+  }
+  // null or 0 disables the bound deliberately. A negative or NaN one is a mistake, and a
+  // handler bound that silently does not apply is the failure this option exists to stop.
+  if (timeoutMs !== null && timeoutMs !== 0 && !(Number.isFinite(timeoutMs) && timeoutMs > 0)) {
+    throw new TypeError(
+      'webhook-engine: retry timeoutMs must be a positive number of milliseconds, or null to disable.',
+    );
   }
 }
 
@@ -101,7 +153,7 @@ export async function retry(fn, options = {}) {
   const config = { ...DEFAULT_RETRY, random: Math.random, ...options };
   validate(config);
 
-  const { attempts, sleep = defaultSleep, shouldRetry, onAttempt } = config;
+  const { attempts, timeoutMs, sleep = defaultSleep, shouldRetry, onAttempt } = config;
   const errors = [];
 
   // The attempt bound is expressed twice: here, and in the `last` check below. The
@@ -111,7 +163,7 @@ export async function retry(fn, options = {}) {
   // inside it staying correct — but it means this line is not the one under test.
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      const result = await fn(attempt);
+      const result = await runAttempt(fn, attempt, timeoutMs);
       return { ok: true, result, attempts: attempt, errors };
     } catch (thrown) {
       const record = toErrorRecord(thrown, attempt);

@@ -229,3 +229,128 @@ test('a dead letter record assembled by hand from a parsed body is refused by th
   // And the builder refuses it one layer earlier, so neither route gets there.
   assert.throws(() => buildDeadLetterRecord(handRolled), /rawBody/);
 });
+
+test('a redelivery arriving while the dead letter is being written cannot start the handler again', async () => {
+  // The window between releasing the reservation and the record becoming durable. If the
+  // key is released first, the event is briefly covered by neither the reservation nor a
+  // record, and a duplicate that lands in that gap reserves cleanly and runs the handler a
+  // second time. The DLQ's push is the seam, so the redelivery is fired from inside it.
+  let handlerRuns = 0;
+  let secondOutcome = null;
+
+  const dlq = new MemoryDeadLetterQueue();
+  const push = dlq.push.bind(dlq);
+  let engine;
+  let fired = false;
+  dlq.push = async (record) => {
+    // The guard is set BEFORE the await. Setting it after lets the nested delivery's own
+    // dead letter re-enter this hook, and the test deadlocks instead of asserting.
+    if (!fired) {
+      fired = true;
+      secondOutcome = (await engine.receive(delivery(RAW))).outcome;
+    }
+    return push(record);
+  };
+
+  const RAW = JSON.stringify({ id: 'evt_race', type: 'payout.failed' });
+  engine = engineWith(
+    async () => {
+      handlerRuns += 1;
+      throw new Error('downstream down');
+    },
+    { dlq },
+  );
+
+  assert.equal((await engine.receive(delivery(RAW))).outcome, 'dead_lettered');
+  assert.equal(secondOutcome, 'in_flight', 'the duplicate must still see a reservation');
+  assert.equal(handlerRuns, 3, 'three attempts for the first delivery, and none for the second');
+});
+
+test('a release that fails after the record is durable does not turn a truthful 200 into an error', async () => {
+  // Once the record exists the event is safe and responsibility has transferred, so the
+  // 200 is honest. The cost of the failed release is a key stuck until its TTL, which the
+  // operator needs told rather than discovering it when a replay is refused.
+  const store = new MemoryIdempotencyStore();
+  store.release = async () => {
+    throw new Error('store unreachable');
+  };
+
+  const engine = engineWith(
+    async () => {
+      throw new Error('downstream down');
+    },
+    { store },
+  );
+
+  const response = await engine.receive(delivery({ id: 'evt_release_fail', type: 'payout.failed' }));
+
+  assert.equal(response.status, 200);
+  assert.equal(response.outcome, 'dead_lettered');
+  assert.equal(response.releaseFailed, 'store unreachable');
+  assert.equal((await engine.dlq.list()).length, 1, 'the record is what makes the 200 honest');
+});
+
+test('a handler that hangs is dead lettered rather than holding the connection open', { timeout: 2000 }, async () => {
+  // End to end, the failure retry.js gained a bound for. Without it this delivery never
+  // returns at all: no retry, no record, no response, and the key reserved the whole time.
+  const signals = [];
+  const engine = engineWith(
+    (event, { signal }) =>
+      new Promise(() => {
+        signals.push(signal);
+      }),
+    { retry: { attempts: 2, baseMs: 1, maxMs: 5, timeoutMs: 10 } },
+  );
+
+  const response = await engine.receive(delivery({ id: 'evt_hang', type: 'payout.failed' }));
+
+  assert.equal(response.outcome, 'dead_lettered');
+  assert.equal(response.attempts, 2);
+  assert.equal(signals.length, 2, 'the handler is reached on both attempts');
+  assert.ok(
+    signals.every((signal) => signal.aborted),
+    'every abandoned attempt aborts its own signal',
+  );
+  assert.match((await engine.dlq.list())[0].errors[0].message, /timed out after 10ms/);
+});
+
+test('a dead lettered record replays byte for byte when the body is not valid UTF-8', { timeout: 2000 }, async () => {
+  // The DLQ's whole purpose is replay, and replay re-verifies. Decoding the body to a
+  // string on the way in makes `Buffer -> string -> Buffer` lossy for anything that is not
+  // valid UTF-8: the bytes that come back out are not the bytes that were signed, so the
+  // record fails verification at exactly the moment it exists to be used.
+  //
+  // The suite's existing replay counterfactual uses a string body, so it passes either
+  // way. This is the input shape that separates them.
+  const rawBody = Buffer.concat([
+    Buffer.from('{"id":"evt_bytes","note":"'),
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from('"}'),
+  ]);
+  assert.notDeepEqual(
+    Buffer.from(rawBody.toString('utf8'), 'utf8'),
+    rawBody,
+    'the fixture has to actually survive the round trip badly, or it proves nothing',
+  );
+
+  const request = {
+    rawBody,
+    headers: {
+      'content-type': 'application/json',
+      'webhook-signature': signHeader({ rawBody, secret: SECRET, timestamp: SIGNED_AT }),
+    },
+  };
+
+  let failing = true;
+  const engine = engineWith(async () => {
+    if (failing) throw new Error('downstream down');
+    return 'replayed';
+  });
+
+  assert.equal((await engine.receive(request)).outcome, 'dead_lettered');
+  const [record] = await engine.dlq.list();
+
+  failing = false;
+  const response = await engine.replay(record.id);
+  assert.equal(response.outcome, 'processed', 'the stored record must still verify');
+});

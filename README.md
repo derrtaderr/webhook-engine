@@ -249,11 +249,39 @@ pattern that stops it recovering.
 An error carrying `retryable: false` stops immediately, and `shouldRetry` lets you
 classify by status code or anything else.
 
+**Each attempt is bounded in time, not just in count.** A handler that rejects is what
+retry was always for. A handler that never settles is the other half: it holds the loop
+open forever, so the retry never fires, the dead letter is never written, and the
+connection stays open with the key reserved. `timeoutMs` makes a hang an ordinary failed
+attempt — backoff and the attempt bound apply as usual, and exhaustion dead-letters like
+any other permanent failure.
+
+```js
+createEngine({
+  secret,
+  retry: { attempts: 4, timeoutMs: 10_000 },
+
+  async handler(event, { signal }) {
+    await fetch(ledgerUrl, { signal });   // stops when the engine stops waiting
+  },
+});
+```
+
+The signal is cooperative. A handler that ignores it is abandoned rather than stopped, so
+pass it to anything that accepts one. `timeoutMs: null` disables the bound deliberately;
+a negative or NaN value is refused at construction, because a bound that silently does not
+apply is the failure the option exists to prevent.
+
 ### Dead letter queue
 
 The record holds the raw bytes unparsed, the headers including the signature, the event
 id, the attempt count and every error in order. That is what makes it replayable through
 the same verification it passed on the way in.
+
+The bytes are kept twice on purpose. `rawBody` is the decoded string, because a record a
+human can read is worth more than one they cannot. `rawBodyBase64` is exactly what
+arrived, and replay reconstructs from that, because `Buffer → string → Buffer` is lossy
+for a body that is not valid UTF-8 and replay re-verifies against what was signed.
 
 ```js
 for (const record of await engine.dlq.list()) {
@@ -266,6 +294,12 @@ await engine.replay(recordId, { skipVerification: true }); // for a record older
 
 Storing the parsed body is the convenient choice and it silently destroys replayability,
 so a non-string `rawBody` is refused at the boundary and refused again in the store.
+
+The record becomes durable **before** the idempotency key is released, so there is no
+instant where the event is covered by neither. If the release then fails, the reply stays
+200 — the record exists, so the event is safe and responsibility has transferred — and the
+result carries `releaseFailed`. The key stays claimed until its TTL, which means a replay
+inside that window is refused as `in_flight`, so the field is worth logging.
 
 A full queue **throws** rather than evicting. Every other buffer here drops its oldest
 entry; this one holds the events that already failed everywhere else.
@@ -319,10 +353,12 @@ signature is rejected rather than normalised. Every provider this was written ag
 sends lowercase hex or base64. If yours does not, normalise it before handing it over,
 deliberately, in your own code.
 
-**Retries happen inside the request.** With the defaults, four attempts can hold a
-connection for around a minute and a half of wall clock. If your handler is slow, the
-right design is to verify, enqueue, return 200, and let this library's job end at the
-enqueue.
+**Retries happen inside the request.** With the defaults — four attempts, a 10s bound on
+each, and at most 1.75s of backoff between them — a delivery can hold a connection for
+41.75 seconds in the worst case. That figure is derived from `DEFAULT_RETRY` by the test
+suite rather than written down beside it, so it cannot drift from the code. If your
+handler is slow, the right design is to verify, enqueue, return 200, and let this
+library's job end at the enqueue.
 
 **The event id is only as trustworthy as its source.** It is read from the signed body
 first for that reason. If your provider puts the id only in a header and does not bind

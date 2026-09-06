@@ -62,7 +62,7 @@ function assertDlq(dlq) {
 /**
  * @param {object} options
  * @param {string|string[]} options.secret signing key, or several during a rotation
- * @param {(event: {id: string, body: unknown, rawBody: string, headers: object}) => Promise<unknown>} options.handler
+ * @param {(event: {id: string, body: unknown, rawBody: string, headers: object}, context: {signal: AbortSignal}) => Promise<unknown>} options.handler
  * @param {object} [options.store] idempotency store, default in-memory
  * @param {object} [options.dlq] dead letter queue, default in-memory
  * @param {object} [options.retry] retry options, see DEFAULT_RETRY
@@ -161,6 +161,7 @@ export function createEngine({
       return report({ status: 401, outcome: 'rejected', reason: 'no_raw_body' });
     }
 
+    const rawBytes = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), 'utf8');
     const rawText = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
 
     let body = rawText;
@@ -188,7 +189,9 @@ export function createEngine({
     }
 
     const event = { id, body, rawBody: rawText, headers: Object.fromEntries(lower) };
-    const outcome = await retryFn(() => handler(event), retryConfig);
+    // The attempt's context carries the AbortSignal, so a handler can stop its own work
+    // when the engine stops waiting for it.
+    const outcome = await retryFn((attempt, context) => handler(event, context), retryConfig);
 
     if (outcome.ok) {
       await store.complete(id, outcome.result);
@@ -201,15 +204,24 @@ export function createEngine({
       });
     }
 
-    // The key is released before the record is written, so a manual redelivery of a dead
-    // lettered event is allowed to run rather than being reported as a duplicate.
-    await store.release(id);
-
+    // THE RECORD BECOMES DURABLE BEFORE THE RESERVATION IS RELEASED.
+    //
+    // Releasing first leaves a window in which the event is covered by neither the
+    // reservation nor a record, and a duplicate delivery landing inside it reserves
+    // cleanly and runs the handler a second time while the first copy is still on its way
+    // to the queue. Pushing first means the cover is continuous: the reservation holds
+    // until a durable record replaces it.
+    //
+    // The release still happens, so the original reason for the old order survives — a
+    // manual redelivery of a dead lettered event is allowed to run rather than being
+    // refused as a duplicate.
+    let record;
     try {
-      const record = await dlq.push(
+      record = await dlq.push(
         buildDeadLetterRecord({
           eventId: id,
           rawBody: rawText,
+          rawBodyBase64: rawBytes.toString('base64'),
           headers: Object.fromEntries(lower),
           attempts: outcome.attempts,
           errors: outcome.errors,
@@ -217,16 +229,10 @@ export function createEngine({
           now: () => new Date(now()),
         }),
       );
-      return report({
-        status: 200,
-        outcome: 'dead_lettered',
-        eventId: id,
-        attempts: outcome.attempts,
-        dlqId: record.id,
-        errors: outcome.errors,
-      });
     } catch (error) {
-      // Nothing was stored, so the 200 above would have been a lie. Ask for a redelivery.
+      // Nothing was stored, so a 200 would have been a lie. Release the key so the
+      // provider's redelivery is allowed to run, and ask for one.
+      await store.release(id);
       return report({
         status: 500,
         outcome: 'dead_letter_failed',
@@ -234,6 +240,27 @@ export function createEngine({
         reason: error.message,
       });
     }
+
+    // The record is durable, so the event is safe and the 200 is honest whatever happens
+    // next. A release that fails here costs a key stuck until its TTL, and a replay
+    // refused as in flight until then — worth reporting, not worth inverting a truthful
+    // status over.
+    let releaseFailed;
+    try {
+      await store.release(id);
+    } catch (error) {
+      releaseFailed = error.message;
+    }
+
+    return report({
+      status: 200,
+      outcome: 'dead_lettered',
+      eventId: id,
+      attempts: outcome.attempts,
+      dlqId: record.id,
+      errors: outcome.errors,
+      ...(releaseFailed === undefined ? {} : { releaseFailed }),
+    });
   }
 
   /**
@@ -250,10 +277,14 @@ export function createEngine({
     const record = typeof recordOrId === 'string' ? await dlq.get(recordOrId) : recordOrId;
     if (!record) return report({ status: 404, outcome: 'not_found' });
 
-    const response = await receive(
-      { rawBody: record.rawBody, headers: record.headers },
-      { skipVerification },
-    );
+    // The bytes, not the decoded string, or a body that was not valid UTF-8 fails the
+    // verification it passed on the way in.
+    const replayBody =
+      typeof record.rawBodyBase64 === 'string'
+        ? Buffer.from(record.rawBodyBase64, 'base64')
+        : record.rawBody;
+
+    const response = await receive({ rawBody: replayBody, headers: record.headers }, { skipVerification });
 
     // Drained only on a real success. A refused replay leaves the record where it was.
     if (response.outcome === 'processed') await dlq.remove(record.id);

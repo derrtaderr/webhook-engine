@@ -92,6 +92,7 @@ function redactHeaders(headers, redacted) {
 export function buildDeadLetterRecord({
   eventId,
   rawBody,
+  rawBodyBase64,
   headers,
   attempts,
   errors = [],
@@ -103,6 +104,12 @@ export function buildDeadLetterRecord({
     id: `dlq_${randomBytes(8).toString('hex')}`,
     eventId,
     rawBody,
+    // The bytes as received. `rawBody` stays because a record a human reads is worth more
+    // than one they cannot, but a body that is not valid UTF-8 does not survive
+    // Buffer -> string -> Buffer, and replay re-verifies against the bytes that were
+    // signed. This field is what makes the replay guarantee literally true.
+    rawBodyBase64:
+      rawBodyBase64 ?? (typeof rawBody === 'string' ? Buffer.from(rawBody, 'utf8').toString('base64') : undefined),
     headers: headers && typeof headers === 'object' ? redactHeaders(headers, redacted) : headers,
     attempts,
     errors: [...errors],
