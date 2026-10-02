@@ -375,6 +375,14 @@ costs nothing.
 
 It was found by writing the adversarial test, not by reading the code.
 
+**Follow-up, hardening pass 02.** The last two sentences above were wrong in two ways. The
+verifier did not bind an id at all; it signed `${timestamp}.${body}`, so the Standard Webhooks
+case was a claim, not a code path. And the two values do not always agree: in many CRM
+webhooks `body.id` is the record id, so body-first dropped a second real event about the same
+record as a duplicate. `bindId` now verifies `${id}.${timestamp}.${body}` with the id from the
+header, and when it is set the verified header id decides. Without it the body still decides,
+for the reason given above, and a provider whose `body.id` is a record id passes `eventId`.
+
 ---
 
 ## 8. Hardening pass 01 (2026-09-05)
@@ -481,7 +489,7 @@ guard added by this pass was reverted in turn against the full suite.
 | Replay from `rawBody` instead of the stored bytes | 1 | the non-UTF-8 replay test |
 
 Each mutation was caught by the test written for it and by nothing else spurious, and the
-suite returns to 137 passing when restored.
+suite returns to 137 passing when restored. (137 was the suite at the time of this run. It has grown since, and the README carries the current count.)
 
 Worth recording honestly, because it is the more useful finding: the original mutation run
 scored 31 of 32 and did not surface any of these three. A mutation check answers "does a test

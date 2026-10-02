@@ -406,7 +406,7 @@ schemas, no `constructEvent` equivalent. Bytes and headers in, a status out.
 ## Tests
 
 ```bash
-npm test          # 129 tests, no network, no install step
+npm test          # 153 tests, no network, no install step
 ```
 
 Two files carry the weight. `test/adversarial-signature.test.js` reproduces the lenient

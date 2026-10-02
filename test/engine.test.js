@@ -82,7 +82,7 @@ test('a verified delivery with no event id anywhere is a 400', async () => {
   assert.equal(response.outcome, 'no_event_id');
 });
 
-test('the event id falls back to the body when the header does not carry one', async () => {
+test('the event id comes from the signed body, so a delivery with no id header still resolves', async () => {
   const engine = engineWith(async () => 'ok');
   const request = delivery({ id: 'evt_4', type: 'order.created' });
   delete request.headers['webhook-id'];
@@ -290,7 +290,7 @@ test('a misconfigured engine refuses to be constructed', async () => {
   assert.throws(() => createEngine({ secret: SECRET, handler: async () => {}, dlq: {} }), /dlq/i);
 });
 
-test('a request with no rawBody is a 400 rather than an exception', async () => {
+test('a request with no rawBody is a 401 rather than an exception', async () => {
   const engine = engineWith(async () => 'ok');
   const response = await engine.receive({ headers: {} });
   assert.equal(response.status, 401);
