@@ -82,7 +82,7 @@ test('a verified delivery with no event id anywhere is a 400', async () => {
   assert.equal(response.outcome, 'no_event_id');
 });
 
-test('the event id falls back to the body when the header does not carry one', async () => {
+test('the event id comes from the signed body, so a delivery with no id header still resolves', async () => {
   const engine = engineWith(async () => 'ok');
   const request = delivery({ id: 'evt_4', type: 'order.created' });
   delete request.headers['webhook-id'];
@@ -290,7 +290,7 @@ test('a misconfigured engine refuses to be constructed', async () => {
   assert.throws(() => createEngine({ secret: SECRET, handler: async () => {}, dlq: {} }), /dlq/i);
 });
 
-test('a request with no rawBody is a 400 rather than an exception', async () => {
+test('a request with no rawBody is a 401 rather than an exception', async () => {
   const engine = engineWith(async () => 'ok');
   const response = await engine.receive({ headers: {} });
   assert.equal(response.status, 401);
@@ -410,4 +410,109 @@ test('a valid engine never strands a reservation on a config error, because ther
   });
   assert.equal((await engine.receive(delivery({ id: 'evt_boot', type: 'ok' }))).outcome, 'processed');
   assert.equal((await store.reserve('evt_boot')).state, 'done');
+});
+
+test('a complete() that throws after a successful handler is a 200 that reports it, and a duplicate never reruns the handler', async () => {
+  const inner = new MemoryIdempotencyStore({ now: () => NOW });
+  const store = {
+    reserve: (key) => inner.reserve(key),
+    complete: async () => { throw new Error('store went away'); },
+    release: (key) => inner.release(key),
+  };
+  let calls = 0;
+  const engine = engineWith(async () => { calls += 1; return 'charged'; }, { store });
+
+  const first = await engine.receive(delivery({ id: 'evt_complete_fails' }));
+  assert.equal(first.status, 200, 'the work was done, so 200 is the true answer');
+  assert.equal(first.outcome, 'processed');
+  assert.equal(first.result, 'charged');
+  assert.equal(first.completeFailed, 'store went away');
+
+  const duplicate = await engine.receive(delivery({ id: 'evt_complete_fails' }));
+  assert.equal(duplicate.status, 409, 'the key is left in flight rather than released');
+  assert.equal(calls, 1, 'a duplicate must not charge twice');
+});
+
+/** A delivery whose signature binds the webhook-id header, Standard Webhooks payload shape. */
+function boundDelivery(body, id) {
+  const rawBody = JSON.stringify(body);
+  return {
+    rawBody,
+    headers: {
+      'webhook-id': id,
+      'webhook-signature': signHeader({ rawBody, secret: SECRET, timestamp: SIGNED_AT, signedId: id }),
+    },
+  };
+}
+
+test('with bindId, the signed header id decides, so two real events about one CRM record are both processed', async () => {
+  let calls = 0;
+  const engine = engineWith(async () => { calls += 1; return 'ok'; }, { bindId: true });
+
+  const first = await engine.receive(boundDelivery({ id: 'rec_42', type: 'contact.updated' }, 'msg_a'));
+  const second = await engine.receive(boundDelivery({ id: 'rec_42', type: 'contact.updated' }, 'msg_b'));
+
+  assert.equal(first.eventId, 'msg_a');
+  assert.equal(second.eventId, 'msg_b');
+  assert.equal(second.outcome, 'processed', 'body.id is a record id here, not an event id');
+  assert.equal(calls, 2);
+  assert.equal((await engine.receive(boundDelivery({ id: 'rec_42', type: 'contact.updated' }, 'msg_a'))).outcome, 'duplicate');
+});
+
+test('with bindId, an id rewritten in flight fails verification, and a missing id is refused', async () => {
+  const engine = engineWith(async () => 'ok', { bindId: true });
+  const tampered = boundDelivery({ id: 'rec_42' }, 'msg_a');
+  tampered.headers['webhook-id'] = 'msg_fresh';
+  const rewritten = await engine.receive(tampered);
+  assert.equal(rewritten.status, 401);
+  assert.equal(rewritten.reason, 'no_matching_signature');
+
+  const missing = boundDelivery({ id: 'rec_42' }, 'msg_a');
+  delete missing.headers['webhook-id'];
+  const refused = await engine.receive(missing);
+  assert.equal(refused.status, 401);
+  assert.equal(refused.reason, 'no_signed_id');
+});
+
+test('without bindId the body still decides, because an unsigned header is editable in flight', async () => {
+  const engine = engineWith(async () => 'ok');
+  const request = delivery({ id: 'evt_body', type: 'x' }, { id: 'msg_header' });
+  assert.equal((await engine.receive(request)).eventId, 'evt_body');
+});
+
+test('replaying a record whose event already succeeded by redelivery drains it as already processed', async () => {
+  let failing = true;
+  let calls = 0;
+  const engine = engineWith(async () => {
+    calls += 1;
+    if (failing) throw new Error('down');
+    return 'done by redelivery';
+  });
+
+  await engine.receive(delivery({ id: 'evt_redelivered' }));
+  const [record] = await engine.dlq.list();
+  failing = false;
+  const redelivery = await engine.receive(delivery({ id: 'evt_redelivered' }));
+  assert.equal(redelivery.outcome, 'processed', 'the key was released, so the provider redelivery runs');
+  const callsBeforeReplay = calls;
+
+  const replayed = await engine.replay(record.id);
+  assert.equal(replayed.outcome, 'already_processed');
+  assert.equal(replayed.status, 200);
+  assert.equal(replayed.result, 'done by redelivery');
+  assert.equal(calls, callsBeforeReplay, 'the handler does not run again');
+  assert.equal((await engine.dlq.list()).length, 0, 'the stale record is drained, not replayed as a duplicate forever');
+});
+
+test('a replay refused as in flight leaves the record where it was', async () => {
+  const store = new MemoryIdempotencyStore({ now: () => NOW });
+  let failing = true;
+  const engine = engineWith(async () => { if (failing) throw new Error('down'); return 'ok'; }, { store });
+  await engine.receive(delivery({ id: 'evt_inflight_replay' }));
+  const [record] = await engine.dlq.list();
+  await store.reserve('evt_inflight_replay');
+  failing = false;
+  const replayed = await engine.replay(record.id);
+  assert.equal(replayed.outcome, 'in_flight');
+  assert.equal((await engine.dlq.list()).length, 1);
 });

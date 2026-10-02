@@ -75,6 +75,8 @@ function assertDlq(dlq) {
  * @param {object} [options.retry] retry options, see DEFAULT_RETRY
  * @param {string} [options.signatureHeader]
  * @param {string} [options.idHeader]
+ * @param {boolean} [options.bindId] the provider signs `${id}.${timestamp}.${body}` with the id
+ *   from idHeader. Verified, and the header id then decides the event id
  * @param {string} [options.timestampHeader] for providers that deliver it separately
  * @param {(body: unknown, headers: Map<string,string>, rawBody: string) => string|null} [options.eventId]
  * @param {(rawBody: string) => unknown} [options.parse] pass null to skip parsing
@@ -89,6 +91,7 @@ export function createEngine({
   retry: retryOptions = {},
   signatureHeader = DEFAULT_SIGNATURE_HEADER,
   idHeader = DEFAULT_ID_HEADER,
+  bindId = false,
   timestampHeader = null,
   eventId,
   parse = JSON.parse,
@@ -120,23 +123,31 @@ export function createEngine({
   // could release it, which strands the event for a full TTL instead of failing a boot.
   const retryConfig = resolveRetryConfig({ ...retryOptions, ...(sleep ? { sleep } : {}) });
 
-  // THE SIGNED BODY DECIDES, AND THE HEADER IS ONLY A FALLBACK.
+  // WHATEVER THE SIGNATURE COVERS DECIDES THE EVENT ID.
   //
-  // The HMAC covers the body and the timestamp. It does not cover any other header, so
-  // an id read out of `webhook-id` is attacker-editable by anyone who can rewrite
-  // headers in flight — a proxy, a sidecar, a compromised load balancer. Preferring the
-  // header would let the same signed event be presented under a fresh id and processed a
-  // second time, which defeats deduplication without ever touching the signature.
+  // By default the HMAC covers the body and the timestamp and no header, so an id read
+  // out of `webhook-id` is attacker-editable by anyone who can rewrite headers in flight
+  // (a proxy, a sidecar, a compromised load balancer). Preferring it would let the same
+  // signed event be presented under a fresh id and processed a second time. So the body
+  // decides and the header is only a fallback.
   //
-  // Where a provider does bind the id into the signature (the Standard Webhooks scheme
-  // signs `${id}.${timestamp}.${body}`), the header is as trustworthy as the body and
-  // this ordering costs nothing, because the two values agree.
-  const defaultEventId = (body, headers) => {
-    const fromBody = body?.id ?? body?.event_id ?? body?.eventId;
-    if (typeof fromBody === 'string' && fromBody.length > 0) return fromBody;
-    const fromHeader = headers.get(idHeader);
-    return typeof fromHeader === 'string' && fromHeader.length > 0 ? fromHeader : null;
+  // With `bindId`, the provider signs `${id}.${timestamp}.${body}` (the Standard Webhooks
+  // payload shape) and verification binds the header id. Then the header is as
+  // trustworthy as the body and the better source: in CRM webhooks `body.id` is often the
+  // RECORD id, so two real events about one record would otherwise collapse into one and
+  // the second would be dropped as a duplicate. Without id binding, a provider whose
+  // body.id is a record id needs an explicit `eventId` function; see the README.
+  const fromHeader = (headers) => {
+    const value = headers.get(idHeader);
+    return typeof value === 'string' && value.length > 0 ? value : null;
   };
+  const fromBody = (body) => {
+    const value = body?.id ?? body?.event_id ?? body?.eventId;
+    return typeof value === 'string' && value.length > 0 ? value : null;
+  };
+  const defaultEventId = bindId
+    ? (body, headers) => fromHeader(headers) ?? fromBody(body)
+    : (body, headers) => fromBody(body) ?? fromHeader(headers);
   const resolveEventId = eventId ?? defaultEventId;
 
   function report(info) {
@@ -153,6 +164,10 @@ export function createEngine({
 
     if (!skipVerification) {
       const timestamp = timestampHeader ? Number(lower.get(timestampHeader)) : undefined;
+      const signedId = bindId ? lower.get(idHeader) : null;
+      if (bindId && (typeof signedId !== 'string' || signedId.length === 0)) {
+        return report({ status: 401, outcome: 'rejected', reason: 'no_signed_id' });
+      }
       const verified = verifySignature({
         rawBody,
         header: lower.get(signatureHeader),
@@ -163,6 +178,7 @@ export function createEngine({
         algorithm,
         encoding,
         now: now(),
+        signedId,
       });
       if (!verified.valid) {
         return report({ status: 401, outcome: 'rejected', reason: verified.reason });
@@ -204,13 +220,27 @@ export function createEngine({
     const outcome = await retryFn((attempt, context) => handler(event, context), retryConfig);
 
     if (outcome.ok) {
-      await store.complete(id, outcome.result);
+      // THE WORK IS DONE, SO A FAILED complete() IS REPORTED, NOT RETURNED AS THE ANSWER.
+      //
+      // Letting it throw hands the caller an exception, the provider sees a 5xx and
+      // redelivers, and every redelivery meets a key still in flight: a 409 for a full TTL
+      // on an event that already succeeded, until the provider disables the endpoint.
+      // Releasing the key instead would let a duplicate run the handler a second time.
+      // So the 200 stands and the key stays in flight until its TTL: a stray duplicate is
+      // refused with a 409, and the handler never runs twice.
+      let completeFailed;
+      try {
+        await store.complete(id, outcome.result);
+      } catch (error) {
+        completeFailed = error.message;
+      }
       return report({
         status: 200,
         outcome: 'processed',
         eventId: id,
         result: outcome.result,
         attempts: outcome.attempts,
+        ...(completeFailed === undefined ? {} : { completeFailed }),
       });
     }
 
@@ -307,8 +337,18 @@ export function createEngine({
 
     const response = await receive({ rawBody: replayBody, headers: record.headers }, { skipVerification });
 
-    // Drained only on a real success. A refused replay leaves the record where it was.
-    if (response.outcome === 'processed') await dlq.remove(record.id);
+    // Drained only when the event is done. A refused replay leaves the record where it was.
+    if (response.outcome === 'processed') {
+      await dlq.remove(record.id);
+      return { ...response, replayedFrom: record.id };
+    }
+    // The key was released after the dead letter push, so a provider redelivery may have
+    // succeeded since. The event is done; the record is stale. Without draining it, every
+    // replay would come back as a duplicate and the record would sit in the queue forever.
+    if (response.outcome === 'duplicate') {
+      await dlq.remove(record.id);
+      return { ...response, outcome: 'already_processed', replayedFrom: record.id };
+    }
     return { ...response, replayedFrom: record.id };
   }
 
