@@ -204,13 +204,27 @@ export function createEngine({
     const outcome = await retryFn((attempt, context) => handler(event, context), retryConfig);
 
     if (outcome.ok) {
-      await store.complete(id, outcome.result);
+      // THE WORK IS DONE, SO A FAILED complete() IS REPORTED, NOT RETURNED AS THE ANSWER.
+      //
+      // Letting it throw hands the caller an exception, the provider sees a 5xx and
+      // redelivers, and every redelivery meets a key still in flight: a 409 for a full TTL
+      // on an event that already succeeded, until the provider disables the endpoint.
+      // Releasing the key instead would let a duplicate run the handler a second time.
+      // So the 200 stands and the key stays in flight until its TTL: a stray duplicate is
+      // refused with a 409, and the handler never runs twice.
+      let completeFailed;
+      try {
+        await store.complete(id, outcome.result);
+      } catch (error) {
+        completeFailed = error.message;
+      }
       return report({
         status: 200,
         outcome: 'processed',
         eventId: id,
         result: outcome.result,
         attempts: outcome.attempts,
+        ...(completeFailed === undefined ? {} : { completeFailed }),
       });
     }
 

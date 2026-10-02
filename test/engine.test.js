@@ -411,3 +411,24 @@ test('a valid engine never strands a reservation on a config error, because ther
   assert.equal((await engine.receive(delivery({ id: 'evt_boot', type: 'ok' }))).outcome, 'processed');
   assert.equal((await store.reserve('evt_boot')).state, 'done');
 });
+
+test('a complete() that throws after a successful handler is a 200 that reports it, and a duplicate never reruns the handler', async () => {
+  const inner = new MemoryIdempotencyStore({ now: () => NOW });
+  const store = {
+    reserve: (key) => inner.reserve(key),
+    complete: async () => { throw new Error('store went away'); },
+    release: (key) => inner.release(key),
+  };
+  let calls = 0;
+  const engine = engineWith(async () => { calls += 1; return 'charged'; }, { store });
+
+  const first = await engine.receive(delivery({ id: 'evt_complete_fails' }));
+  assert.equal(first.status, 200, 'the work was done, so 200 is the true answer');
+  assert.equal(first.outcome, 'processed');
+  assert.equal(first.result, 'charged');
+  assert.equal(first.completeFailed, 'store went away');
+
+  const duplicate = await engine.receive(delivery({ id: 'evt_complete_fails' }));
+  assert.equal(duplicate.status, 409, 'the key is left in flight rather than released');
+  assert.equal(calls, 1, 'a duplicate must not charge twice');
+});
