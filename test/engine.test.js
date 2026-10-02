@@ -432,3 +432,50 @@ test('a complete() that throws after a successful handler is a 200 that reports 
   assert.equal(duplicate.status, 409, 'the key is left in flight rather than released');
   assert.equal(calls, 1, 'a duplicate must not charge twice');
 });
+
+/** A delivery whose signature binds the webhook-id header, Standard Webhooks payload shape. */
+function boundDelivery(body, id) {
+  const rawBody = JSON.stringify(body);
+  return {
+    rawBody,
+    headers: {
+      'webhook-id': id,
+      'webhook-signature': signHeader({ rawBody, secret: SECRET, timestamp: SIGNED_AT, signedId: id }),
+    },
+  };
+}
+
+test('with bindId, the signed header id decides, so two real events about one CRM record are both processed', async () => {
+  let calls = 0;
+  const engine = engineWith(async () => { calls += 1; return 'ok'; }, { bindId: true });
+
+  const first = await engine.receive(boundDelivery({ id: 'rec_42', type: 'contact.updated' }, 'msg_a'));
+  const second = await engine.receive(boundDelivery({ id: 'rec_42', type: 'contact.updated' }, 'msg_b'));
+
+  assert.equal(first.eventId, 'msg_a');
+  assert.equal(second.eventId, 'msg_b');
+  assert.equal(second.outcome, 'processed', 'body.id is a record id here, not an event id');
+  assert.equal(calls, 2);
+  assert.equal((await engine.receive(boundDelivery({ id: 'rec_42', type: 'contact.updated' }, 'msg_a'))).outcome, 'duplicate');
+});
+
+test('with bindId, an id rewritten in flight fails verification, and a missing id is refused', async () => {
+  const engine = engineWith(async () => 'ok', { bindId: true });
+  const tampered = boundDelivery({ id: 'rec_42' }, 'msg_a');
+  tampered.headers['webhook-id'] = 'msg_fresh';
+  const rewritten = await engine.receive(tampered);
+  assert.equal(rewritten.status, 401);
+  assert.equal(rewritten.reason, 'no_matching_signature');
+
+  const missing = boundDelivery({ id: 'rec_42' }, 'msg_a');
+  delete missing.headers['webhook-id'];
+  const refused = await engine.receive(missing);
+  assert.equal(refused.status, 401);
+  assert.equal(refused.reason, 'no_signed_id');
+});
+
+test('without bindId the body still decides, because an unsigned header is editable in flight', async () => {
+  const engine = engineWith(async () => 'ok');
+  const request = delivery({ id: 'evt_body', type: 'x' }, { id: 'msg_header' });
+  assert.equal((await engine.receive(request)).eventId, 'evt_body');
+});

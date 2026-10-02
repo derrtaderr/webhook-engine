@@ -147,3 +147,13 @@ test('a hex signature does not verify against a receiver expecting base64', () =
   });
   assert.equal(result.valid, false);
 });
+
+test('a signed id is bound into the payload, so an edited id fails verification', async () => {
+  const rawBody = '{"id":"rec_1"}';
+  const timestamp = 1614556800;
+  const header = signHeader({ rawBody, secret: 'whsec_bind', timestamp, signedId: 'msg_1' });
+  const base = { rawBody, header, secret: 'whsec_bind', now: timestamp * 1000 };
+  assert.equal(verifySignature({ ...base, signedId: 'msg_1' }).valid, true);
+  assert.equal(verifySignature({ ...base, signedId: 'msg_2' }).reason, 'no_matching_signature');
+  assert.equal(verifySignature(base).valid, false, 'a signature over an id does not verify as a body-only signature');
+});

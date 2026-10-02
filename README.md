@@ -328,7 +328,8 @@ createEngine({
   retry: { attempts: 4, baseMs: 250, maxMs: 30_000, factor: 2, jitter: true },
 
   signatureHeader: 'webhook-signature',
-  idHeader: 'webhook-id',     // fallback only; the signed body decides first
+  idHeader: 'webhook-id',     // fallback only, unless bindId; the signed body decides first
+  bindId: false,              // the provider signs `${id}.${timestamp}.${body}`; the header id then decides
   timestampHeader: null,      // for providers that deliver it separately
   toleranceSeconds: 300,
   requireTimestamp: true,
@@ -373,6 +374,18 @@ library's job end at the enqueue.
 first for that reason. If your provider puts the id only in a header and does not bind
 that header into the signature, anything on the request path can rewrite it and defeat
 deduplication. That is a property of the provider, not something this library can fix.
+
+**`body.id` is not always an event id.** In Stripe it is (`evt_...`). In many CRM webhooks it
+is the id of the record that changed, so the default would collapse two real events about
+one contact into one and drop the second as a duplicate. Two ways out. If the provider binds
+its delivery id into the signature as `${id}.${timestamp}.${body}`, set `bindId: true`; the
+header id is then verified and decides. If it does not, pass the provider's real event id
+yourself:
+
+```js
+// A CRM whose body.id is the record id and whose payload carries its own event id.
+createEngine({ secret, handler, eventId: (body) => body.eventId ?? null });
+```
 
 **No nonce cache.** The replay window bounds how long a captured request stays usable, and
 idempotency stops it being processed twice. There is no record of every signature ever

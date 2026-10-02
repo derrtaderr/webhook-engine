@@ -54,10 +54,13 @@ export function constantTimeEqual(a, b) {
 /**
  * The bytes that get signed. A timestamp, when present, is bound into the payload so it
  * cannot be edited in flight — a replay window over an unsigned timestamp is decoration.
+ * A signed id, when the provider binds one, goes in front in the Standard Webhooks shape
+ * `${id}.${timestamp}.${body}`, so the id header becomes as trustworthy as the body.
  */
-function signedPayload(bodyBytes, timestamp) {
-  if (timestamp === null || timestamp === undefined) return bodyBytes;
-  return Buffer.concat([Buffer.from(`${timestamp}.`, 'utf8'), bodyBytes]);
+function signedPayload(bodyBytes, timestamp, signedId) {
+  const prefix = [signedId, timestamp].filter((part) => part !== null && part !== undefined);
+  if (prefix.length === 0) return bodyBytes;
+  return Buffer.concat([Buffer.from(`${prefix.join('.')}.`, 'utf8'), bodyBytes]);
 }
 
 function toBytes(rawBody) {
@@ -93,6 +96,7 @@ function normaliseSecrets(secret) {
  * @param {number|null} [options.timestamp] unix seconds, bound into the signed payload
  * @param {string} [options.algorithm]
  * @param {'hex'|'base64'} [options.encoding]
+ * @param {string|null} [options.signedId] an event id to bind into the signed payload
  * @returns {string}
  */
 export function signPayload({
@@ -101,19 +105,20 @@ export function signPayload({
   timestamp = null,
   algorithm = DEFAULT_ALGORITHM,
   encoding = DEFAULT_ENCODING,
+  signedId = null,
 }) {
   const [key] = normaliseSecrets(secret);
   const bytes = toBytes(rawBody);
   if (bytes === null) throw new TypeError('webhook-engine: rawBody must be a string or a Buffer.');
-  return createHmac(algorithm, key).update(signedPayload(bytes, timestamp)).digest(encoding);
+  return createHmac(algorithm, key).update(signedPayload(bytes, timestamp, signedId)).digest(encoding);
 }
 
 /**
  * Produce a full header value in the shape this library parses, so an example can send
  * a realistic request. Emits the timestamped form when given a timestamp.
  */
-export function signHeader({ rawBody, secret, timestamp = null, algorithm, encoding }) {
-  const signature = signPayload({ rawBody, secret, timestamp, algorithm, encoding });
+export function signHeader({ rawBody, secret, timestamp = null, algorithm, encoding, signedId = null }) {
+  const signature = signPayload({ rawBody, secret, timestamp, algorithm, encoding, signedId });
   if (timestamp === null || timestamp === undefined) return `${algorithm ?? DEFAULT_ALGORITHM}=${signature}`;
   return `t=${timestamp},v1=${signature}`;
 }
@@ -130,6 +135,8 @@ export function signHeader({ rawBody, secret, timestamp = null, algorithm, encod
  * @param {number} [options.toleranceSeconds] replay window, in both directions
  * @param {boolean} [options.requireTimestamp] default true
  * @param {number} [options.now] milliseconds, injectable so the window is testable
+ * @param {string|null} [options.signedId] the event id the provider bound into the signature,
+ *   when it binds one. Verified as part of the payload, never merely read
  * @returns {{valid: true, timestamp: number|null, keyIndex: number}
  *          |{valid: false, reason: string, timestamp?: number|null}}
  * @throws {TypeError} when no secret is configured, or the tolerance is not a whole
@@ -145,6 +152,7 @@ export function verifySignature({
   algorithm = DEFAULT_ALGORITHM,
   encoding = DEFAULT_ENCODING,
   now = Date.now(),
+  signedId = null,
 }) {
   const secrets = normaliseSecrets(secret);
 
@@ -173,7 +181,7 @@ export function verifySignature({
     return { valid: false, reason: 'timestamp_out_of_tolerance', timestamp };
   }
 
-  const payload = signedPayload(bytes, timestamp);
+  const payload = signedPayload(bytes, timestamp, signedId);
 
   for (let keyIndex = 0; keyIndex < secrets.length; keyIndex += 1) {
     const expected = createHmac(algorithm, secrets[keyIndex]).update(payload).digest(encoding);
