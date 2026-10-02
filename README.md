@@ -298,6 +298,10 @@ await engine.replay(recordId);                            // verifies again
 await engine.replay(recordId, { skipVerification: true }); // for a record older than the window
 ```
 
+A replay drains the record when the event ends up done: `processed` if the replay ran it, or
+`already_processed` if a provider redelivery had already succeeded after the key was
+released. A replay refused as in flight leaves the record where it was.
+
 Storing the parsed body is the convenient choice and it silently destroys replayability,
 so a non-string `rawBody` is refused at the boundary and refused again in the store.
 

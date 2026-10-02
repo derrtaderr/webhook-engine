@@ -479,3 +479,40 @@ test('without bindId the body still decides, because an unsigned header is edita
   const request = delivery({ id: 'evt_body', type: 'x' }, { id: 'msg_header' });
   assert.equal((await engine.receive(request)).eventId, 'evt_body');
 });
+
+test('replaying a record whose event already succeeded by redelivery drains it as already processed', async () => {
+  let failing = true;
+  let calls = 0;
+  const engine = engineWith(async () => {
+    calls += 1;
+    if (failing) throw new Error('down');
+    return 'done by redelivery';
+  });
+
+  await engine.receive(delivery({ id: 'evt_redelivered' }));
+  const [record] = await engine.dlq.list();
+  failing = false;
+  const redelivery = await engine.receive(delivery({ id: 'evt_redelivered' }));
+  assert.equal(redelivery.outcome, 'processed', 'the key was released, so the provider redelivery runs');
+  const callsBeforeReplay = calls;
+
+  const replayed = await engine.replay(record.id);
+  assert.equal(replayed.outcome, 'already_processed');
+  assert.equal(replayed.status, 200);
+  assert.equal(replayed.result, 'done by redelivery');
+  assert.equal(calls, callsBeforeReplay, 'the handler does not run again');
+  assert.equal((await engine.dlq.list()).length, 0, 'the stale record is drained, not replayed as a duplicate forever');
+});
+
+test('a replay refused as in flight leaves the record where it was', async () => {
+  const store = new MemoryIdempotencyStore({ now: () => NOW });
+  let failing = true;
+  const engine = engineWith(async () => { if (failing) throw new Error('down'); return 'ok'; }, { store });
+  await engine.receive(delivery({ id: 'evt_inflight_replay' }));
+  const [record] = await engine.dlq.list();
+  await store.reserve('evt_inflight_replay');
+  failing = false;
+  const replayed = await engine.replay(record.id);
+  assert.equal(replayed.outcome, 'in_flight');
+  assert.equal((await engine.dlq.list()).length, 1);
+});

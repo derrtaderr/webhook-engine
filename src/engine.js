@@ -337,8 +337,18 @@ export function createEngine({
 
     const response = await receive({ rawBody: replayBody, headers: record.headers }, { skipVerification });
 
-    // Drained only on a real success. A refused replay leaves the record where it was.
-    if (response.outcome === 'processed') await dlq.remove(record.id);
+    // Drained only when the event is done. A refused replay leaves the record where it was.
+    if (response.outcome === 'processed') {
+      await dlq.remove(record.id);
+      return { ...response, replayedFrom: record.id };
+    }
+    // The key was released after the dead letter push, so a provider redelivery may have
+    // succeeded since. The event is done; the record is stale. Without draining it, every
+    // replay would come back as a duplicate and the record would sit in the queue forever.
+    if (response.outcome === 'duplicate') {
+      await dlq.remove(record.id);
+      return { ...response, outcome: 'already_processed', replayedFrom: record.id };
+    }
     return { ...response, replayedFrom: record.id };
   }
 
