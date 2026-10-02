@@ -223,9 +223,12 @@ const store = {
     if (claimed) return { state: 'reserved' };
     const current = await redis.get(`wh:${key}`);
     if (current === 'in_flight') return { state: 'in_flight' };
-    return { state: 'done', result: JSON.parse(current) };
+    return { state: 'done', result: JSON.parse(current).result };
   },
-  complete: (key, result) => redis.set(`wh:${key}`, JSON.stringify(result), { PX: 86_400_000 }),
+  // An envelope, because JSON.stringify(undefined) is undefined and a handler that
+  // returns nothing must still be recorded as done.
+  complete: (key, result) =>
+    redis.set(`wh:${key}`, JSON.stringify({ result: result ?? null }), { PX: 86_400_000 }),
   release: (key) => redis.del(`wh:${key}`),
 };
 
