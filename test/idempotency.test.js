@@ -119,3 +119,39 @@ test('releasing or completing a key nobody reserved is not an error', async () =
   await store.complete('evt_never_seen', 'ok');
   assert.deepEqual(await store.reserve('evt_never_seen'), { state: 'done', result: 'ok' });
 });
+
+test('eviction never drops a live in-flight reservation while a done key can go instead', async () => {
+  // Dropping a live reservation lets a duplicate arriving next reserve cleanly and run the
+  // handler a second time, which is the one thing the store exists to prevent.
+  const store = new MemoryIdempotencyStore({ maxEntries: 3 });
+  await store.reserve('evt_live');                       // oldest, still in flight
+  for (const id of ['evt_done_1', 'evt_done_2']) {
+    await store.reserve(id);
+    await store.complete(id, id);
+  }
+  await store.reserve('evt_new');
+  assert.equal(store.size, 3);
+  assert.equal((await store.reserve('evt_live')).state, 'in_flight', 'the live reservation survived');
+  assert.equal((await store.reserve('evt_done_1')).state, 'reserved', 'the oldest done key was evicted instead');
+});
+
+test('an expired reservation is abandoned, so eviction may take it', async () => {
+  let clock = 0;
+  const store = new MemoryIdempotencyStore({ maxEntries: 2, ttlMs: 1000, now: () => clock });
+  await store.reserve('evt_abandoned');
+  clock = 5000;
+  await store.reserve('evt_live_1');
+  await store.reserve('evt_live_2');
+  assert.equal(store.size, 2);
+  assert.equal((await store.reserve('evt_live_1')).state, 'in_flight');
+  assert.equal((await store.reserve('evt_live_2')).state, 'in_flight');
+});
+
+test('when every entry is a live reservation, the store goes over its cap rather than drop one', async () => {
+  const store = new MemoryIdempotencyStore({ maxEntries: 2 });
+  for (const id of ['evt_a', 'evt_b', 'evt_c']) await store.reserve(id);
+  assert.equal(store.size, 3, 'bounded by concurrency, not by dropping work in flight');
+  for (const id of ['evt_a', 'evt_b', 'evt_c']) {
+    assert.equal((await store.reserve(id)).state, 'in_flight');
+  }
+});

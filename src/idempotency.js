@@ -106,8 +106,24 @@ export class MemoryIdempotencyStore {
     this.#entries.delete(key);
     this.#entries.set(key, entry);
     while (this.#entries.size > this.#maxEntries) {
-      const oldest = this.#entries.keys().next().value;
-      this.#entries.delete(oldest);
+      const victim = this.#evictable();
+      if (victim === undefined) break;
+      this.#entries.delete(victim);
     }
+  }
+
+  /**
+   * The oldest entry that is safe to forget: a completed key, or a reservation past its
+   * TTL (abandoned). NEVER A LIVE RESERVATION. Dropping one lets a duplicate arriving
+   * next reserve cleanly and run the handler a second time. When every entry is a live
+   * reservation the store goes over its cap instead, which is bounded by how much work
+   * is genuinely in flight rather than by how many events have ever arrived.
+   */
+  #evictable() {
+    const now = this.#now();
+    for (const [key, entry] of this.#entries) {
+      if (entry.state === 'done' || now - entry.at > this.#ttlMs) return key;
+    }
+    return undefined;
   }
 }

@@ -317,8 +317,9 @@ redeliver — and both failures are reported: `reason` is the queue's, `releaseF
 store's. A cleanup running inside a failure path must never replace the failure it was
 cleaning up after.
 
-A full queue **throws** rather than evicting. Every other buffer here drops its oldest
-entry; this one holds the events that already failed everywhere else.
+A full queue **throws** rather than evicting. The idempotency store evicts its oldest
+completed or expired key, never a live reservation; this queue holds the events that
+already failed everywhere else.
 
 Credential headers (`authorization`, `cookie`, `x-api-key` and friends) are redacted in
 the record. The signature header is not, because without it there is nothing to replay.
